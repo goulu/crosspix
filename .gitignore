@@ -23,6 +23,7 @@ dist/
 client_secret*.json
 token.json
 *.token
+*.log
 
 # OS / IDE files
 .DS_Store
