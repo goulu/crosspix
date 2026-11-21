@@ -19,6 +19,7 @@ class SyncResult:
     scanned_source: int = 0
     scanned_target: int = 0
     copied: list[PhotoItem] = field(default_factory=list)
+    albums_updated: list[PhotoItem] = field(default_factory=list)
     skipped: list[PhotoItem] = field(default_factory=list)
     errors: list[tuple[PhotoItem, str]] = field(default_factory=list)
 
@@ -44,7 +45,13 @@ class PhotoSynchronizer:
         target: PhotoProvider,
         album: Optional[str] = None,
     ) -> SyncResult:
-        """Perform a one-way synchronization from source provider to target provider."""
+        """Perform a one-way synchronization from source provider to target provider.
+
+        If a photo already exists on `target` (matched by checksum or filename/timestamp)
+        but belongs to additional albums on `source`, `target.sync_albums(...)` is called
+        to link the existing photo into the new albums without re-downloading or
+        duplicating the file.
+        """
         source.connect()
         target.connect()
 
@@ -66,10 +73,37 @@ class PhotoSynchronizer:
         with tempfile.TemporaryDirectory(prefix="crosspix_sync_") as tmp_dir:
             staging_dir = Path(tmp_dir)
             for src_item in source_items:
-                already_exists = any(src_item.matches(dst_item) for dst_item in target_items)
-                if already_exists:
-                    result.skipped.append(src_item)
-                    self._log(f"Skipping existing photo: {src_item.filename}")
+                matched_dst = next(
+                    (dst_item for dst_item in target_items if src_item.matches(dst_item)),
+                    None,
+                )
+                if matched_dst is not None:
+                    missing_albums = [
+                        alb for alb in src_item.albums if alb and alb not in matched_dst.albums
+                    ]
+                    if missing_albums:
+                        if self.dry_run:
+                            result.albums_updated.append(matched_dst)
+                            self._log(
+                                f"[DRY-RUN] Would link existing photo {src_item.filename} "
+                                f"to albums: {missing_albums}"
+                            )
+                        else:
+                            try:
+                                target.sync_albums(matched_dst, missing_albums)
+                                result.albums_updated.append(matched_dst)
+                                self._log(
+                                    f"Linked existing photo {src_item.filename} "
+                                    f"to albums: {missing_albums}"
+                                )
+                            except Exception as exc:
+                                result.errors.append((src_item, str(exc)))
+                                self._log(
+                                    f"Error updating albums for {src_item.filename}: {exc}"
+                                )
+                    else:
+                        result.skipped.append(src_item)
+                        self._log(f"Skipping existing photo: {src_item.filename}")
                     continue
 
                 if self.dry_run:

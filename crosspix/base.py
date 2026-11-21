@@ -23,8 +23,24 @@ class PhotoItem:
     height: Optional[int] = None
     mime_type: str = "image/jpeg"
     album: Optional[str] = None
+    albums: list[str] = field(default_factory=list)
     local_path: Optional[Path] = None
     raw_metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.album and self.album not in self.albums:
+            self.albums.insert(0, self.album)
+        elif self.albums and self.album is None:
+            self.album = self.albums[0]
+
+    def add_album(self, album_name: Optional[str]) -> None:
+        """Associate an album name with this photo if not already present."""
+        if not album_name:
+            return
+        if album_name not in self.albums:
+            self.albums.append(album_name)
+        if self.album is None:
+            self.album = album_name
 
     def matches(self, other: "PhotoItem") -> bool:
         """Return True if two PhotoItems represent the same underlying photo."""
@@ -69,6 +85,12 @@ class PhotoProvider(ABC):
         album: Optional[str] = None,
     ) -> PhotoItem:
         """Upload a local photo file to the provider and return the created PhotoItem."""
+
+    def sync_albums(self, item: PhotoItem, albums: Iterable[str]) -> PhotoItem:
+        """Attach an existing PhotoItem on this provider to additional albums without re-uploading."""
+        for alb in albums:
+            item.add_album(alb)
+        return item
 
     def close(self) -> None:
         """Clean up any active session or resources."""

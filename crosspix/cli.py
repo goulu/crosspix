@@ -27,7 +27,11 @@ def build_provider(spec: str, args: argparse.Namespace) -> PhotoProvider:
         path = value or args.local_dir
         if not path:
             raise ValueError("Local provider requires a path (e.g. 'local:/path/to/photos').")
-        return LocalProvider(root_dir=path)
+        return LocalProvider(
+            root_dir=path,
+            album_delimiter=args.album_delimiter,
+            link_mode=args.link_mode,
+        )
 
     if kind in {"google", "google_photos", "gphotos"}:
         secret_file = value or args.google_secret
@@ -42,10 +46,16 @@ def build_provider(spec: str, args: argparse.Namespace) -> PhotoProvider:
             api_url=args.ente_api_url,
             auth_token=args.ente_token or os.environ.get("ENTE_AUTH_TOKEN"),
             export_dir=export_dir,
+            album_delimiter=args.album_delimiter,
+            link_mode=args.link_mode,
         )
 
     if kind == "immich":
-        base_url = value or args.immich_url or os.environ.get("IMMICH_URL", "http://localhost:2283/api")
+        base_url = (
+            value
+            or args.immich_url
+            or os.environ.get("IMMICH_URL", "http://localhost:2283/api")
+        )
         api_key = args.immich_key or os.environ.get("IMMICH_API_KEY", "")
         return ImmichProvider(base_url=base_url, api_key=api_key)
 
@@ -66,6 +76,17 @@ def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--album", help="Optional album/collection name filter.")
     common.add_argument("--local-dir", help="Default local folder path.")
+    common.add_argument(
+        "--album-delimiter",
+        default=" ",
+        help="Delimiter used to map flat remote album names to local folder hierarchies (default: ' ').",
+    )
+    common.add_argument(
+        "--link-mode",
+        choices=["hardlink", "symlink", "copy"],
+        default="hardlink",
+        help="How album folders link to canonical files in _library/YYYY/MM/ (default: hardlink).",
+    )
     common.add_argument(
         "--google-secret",
         default="gphoto_oauth.json",
@@ -126,7 +147,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             for item in provider.list_photos(album=args.album):
                 count += 1
                 dt_str = item.created_at.isoformat() if item.created_at else "unknown-date"
-                print(f"[{item.platform}] {item.filename} (id={item.id}, date={dt_str})")
+                albums_str = f", albums={item.albums}" if item.albums else ""
+                print(
+                    f"[{item.platform}] {item.filename} (id={item.id}, date={dt_str}{albums_str})"
+                )
             print(f"Total photos listed: {count}")
             return 0
 
@@ -144,7 +168,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             else:
                 res = synchronizer.sync(source, target, album=args.album)
                 print(
-                    f"Sync complete: {len(res.copied)} copied, {len(res.skipped)} skipped, "
+                    f"Sync complete: {len(res.copied)} copied, "
+                    f"{len(res.albums_updated)} album-linked, "
+                    f"{len(res.skipped)} skipped, "
                     f"{len(res.errors)} errors."
                 )
             return 0
