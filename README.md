@@ -7,26 +7,27 @@
 - **Immich** (`crosspix/immich.py`)
 - **Local Folders** (`crosspix/local.py`)
 
-Each platform is implemented in its own dedicated module using established PyPI packages and adheres to a unified `PhotoProvider` interface, enabling seamless one-way (`sync`) or bi-directional (`bisync`) synchronization between any pair of platforms.
+Each platform is implemented in its own dedicated module using established PyPI packages and adheres to a unified `PhotoProvider` interface, enabling seamless one-way (`sync`) or bi-directional (`bisync`) synchronization between any pair of platforms into a single shared local directory without duplicating files.
 
 ---
 
 ## Key Features
 
-- **Any-to-Any Synchronization**: Sync photos between Local Folders, Google Photos, Ente Photos, and Immich in one-way or bi-directional mode.
+- **Any-to-Any Synchronization into a Shared Target**: Synchronize multiple sources (e.g. **Google Photos**, **Ente Photos**, and **Immich**) into the exact same local directory (`/home/user/Images/Photos`). Photos already present from one source are never re-downloaded from another.
 - **Zero-Duplication Multi-Album Local Storage (`_library` + `albums`)**:
-  - Local storage keeps **one single physical copy** of each photo in `_library/YYYY/MM/<filename>` based on its EXIF capture date (`DateTimeOriginal`).
+  - Local storage keeps **one single physical copy** of each photo in `_library/YYYY/MM/<filename>` based on its EXIF capture date (`DateTimeOriginal`) or sidecar JSON metadata.
   - Photos belonging to one or multiple albums are linked inside `albums/...` using **hardlinks** (`--link-mode hardlink`, default) or relative **symlinks** (`--link-mode symlink`), consuming **0 extra bytes** on disk even when a photo belongs to several albums.
 - **Space-Delimited Album Hierarchy Mapping**:
   - Cloud platforms (**Google Photos**, **Immich**, and **Ente Photos**) use flat album/collection titles, whereas local filesystems support nested directories.
   - `crosspix` bridges both models by splitting and joining album names with a configurable delimiter (default: space `" "`, `--album-delimiter " "`):
     - Remote album `"Vacances 2026 Italie"` $\leftrightarrow$ `albums/Vacances/2026/Italie/<filename>`
-    - Remote album `"Famille Eté Favoris"` $\leftrightarrow$ `albums/Famille/Eté/Favoris/<filename>`
-- **Single-Upload Multi-Album Sync across All Cloud Providers**:
-  - **Local $\rightarrow$ Cloud**: `LocalProvider` groups hardlinked, symlinked, or identical files by inode (`st_ino`) and SHA-256 checksum into a single `PhotoItem` carrying all its `albums`. The target cloud provider (**Google Photos**, **Immich**, or **Ente**) uploads the binary bytes **only once** and attaches the resulting media/asset/file ID to all corresponding remote albums/collections.
-  - **Cloud $\rightarrow$ Local**: Cloud providers merge album/collection memberships per photo so each photo is downloaded **only once** to `_library/YYYY/MM/` and linked into every matching `albums/<hierarchy>/` folder.
-  - **Incremental Album Updates (`sync_albums`)**: If a photo already exists on the target platform and is later added to new albums on the source platform, `crosspix` updates only the album links/memberships without re-downloading or re-uploading the photo.
-- **Dry-Run Mode**: Preview which photos will be transferred, linked to albums, or skipped with `--dry-run` (`-n`).
+    - Remote album `"Zermatt 2015"` $\leftrightarrow$ `albums/Zermatt/2015/<filename>`
+- **Selective Download & Multi-Hash Deduplication (`SHA-256` + `SHA-512`)**:
+  - `LocalProvider` computes both `SHA-256` (hex) and `SHA-512` (Base64, matching Ente's native metadata hash) in a single pass, alongside EXIF timestamps and file sizes.
+  - When syncing from **Ente Photos** or **Immich** into a non-empty local directory, `crosspix` compares remote metadata against local files first:
+    - **If a photo already exists locally** (e.g. previously synced from Google Photos), it is **not downloaded again**; `crosspix` only creates any missing album hardlinks under `albums/`.
+    - **Only missing photos** are downloaded individually.
+- **Real-Time Progress Output**: Unbuffered step-by-step console logging shows authentication, album scanning, `[i/N]` download progress, canonical storage, and hardlink creation in real time.
 
 ---
 
@@ -51,20 +52,20 @@ Photos/
                                      # Maps to album: "Famille Eté Favoris"
 ```
 
-### How Each Provider Handles Multi-Album Synchronization
+### How Each Provider Works
 
-| Provider | Module | PyPI Packages | Multi-Album & Deduplication Behavior |
+| Provider | Module | PyPI Packages | Synchronization & Multi-Album Behavior |
 | :--- | :--- | :--- | :--- |
-| **Local Folders** | `crosspix/local.py` | `Pillow` (`PIL`), `piexif` | Stores canonical files in `_library/YYYY/MM/`; links into `albums/<part1>/<part2>/` via `os.link` (hardlink) or `os.symlink`; deduplicates by inode & SHA-256 on scan. |
-| **Google Photos** | `crosspix/google_photos.py` | `gphotospy`, `google-api-python-client`, `google-auth-oauthlib`, `requests` | Merges album memberships on `list_photos()`; uploads once via `/v1/uploads` + `mediaItems:batchCreate` and attaches extra albums via `albums/{id}:batchAddMediaItems`. |
+| **Local Folders** | `crosspix/local.py` | `Pillow` (`PIL`), `piexif` | Stores canonical files in `_library/YYYY/MM/`; links into `albums/<part1>/<part2>/` via `os.link` (hardlink) or `os.symlink`; deduplicates by inode, `SHA-256`, and `SHA-512` (Base64); reads EXIF and Ente/Takeout sidecar JSON timestamps. |
+| **Google Photos** | `crosspix/google_photos.py` | `gphotospy`, `google-api-python-client`, `google-auth-oauthlib`, `requests` | Supports OAuth2 Library API + automatic fallback to the **Google Photos Picker API** (`photospicker.googleapis.com` for post-March 2025 scopes), plus full automatic import of photos & albums from a **Google Takeout** directory (`--google-takeout`). |
+| **Ente Photos** | `crosspix/ente.py` | `PyNaCl` (`nacl`), `httpx`, `requests` | **Selective CLI mode (`ente-cli v0.4.5+`)**: fetches album/file metadata & `SHA-512` hashes via `ente photos album list --all --json` and `ente photos file list --all --json --offline`, and downloads **only missing files** via `ente photos file download`. Also supports local export folders and the E2EE Museum API. |
 | **Immich** | `crosspix/immich.py` | `immichpy`, `httpx` | Enriches assets from `search_assets` with album memberships via `get_all_albums`; uploads once via `POST /assets` and attaches to all albums via `PUT /albums/{id}/assets`. |
-| **Ente Photos** | `crosspix/ente.py` | `PyNaCl` (`nacl`), `httpx`, `requests` | Deduplicates files across `/collections/v2` by SHA-256 hash; encrypts (`SecretBox`) and uploads once to S3 + `POST /files`, then links extra collections via `POST /collections/add-files` (or mirrors via local `export_dir`). |
 
 ---
 
 ## Installation
 
-Clone the repository and use the Python virtual environment (`.venv`):
+Clone the repository and create the Python virtual environment (`.venv`):
 
 ```bash
 git clone https://github.com/goulu/crosspix.git
@@ -77,63 +78,79 @@ pip install -e ".[dev]"
 
 ---
 
-## Configuration & Authentication
+## Configuration & Authentication by Platform
 
-### 1. Local Folders (`local`)
-Point directly to any local directory (`local:/path/to/photos`).
+### 1. Local Folders (`local:/path/to/photos`)
 - `--album-delimiter " "` (default: space `" "`): splits remote album names into nested local directories under `albums/` and joins nested folder names back into remote album titles.
 - `--link-mode {hardlink,symlink,copy}` (default: `hardlink`): controls how files in `albums/...` reference the canonical file in `_library/YYYY/MM/`.
 
+---
+
 ### 2. Google Photos (`google_photos`)
-1. Enable the **Google Photos Library API** in the [Google Cloud Console](https://console.cloud.google.com/).
-2. Create an OAuth 2.0 Client ID (Desktop App) and download the credentials JSON file as `gphoto_oauth.json` (or pass `--google-secret /path/to/oauth.json`).
-3. Alternatively, export an active OAuth token via `GOOGLE_PHOTOS_TOKEN`.
 
-### 3. Ente Photos (`ente`)
-`EnteProvider` supports two workflows:
-- **Direct Ente Museum API (End-to-End Encrypted)**: Uses `PyNaCl` (`nacl.secret.SecretBox`) for client-side encryption/decryption and `httpx`/`requests` to interact with `https://api.ente.io` (or a self-hosted Museum server). Pass `--ente-token` or set `ENTE_AUTH_TOKEN`.
-- **Ente CLI Export Directory**: Point `--ente-export-dir` (or `ente:/path/to/ente-export`) to a local directory synchronized by the official `ente-cli`. It uses the same `_library/YYYY/MM/` + `albums/` hardlink/symlink layout.
+#### A. OAuth 2.0 & Google Photos Picker API
+> **Note on Google's March 31, 2025 API Changes**: Google deprecated the broad `photoslibrary.readonly` scope for reading existing non-app-created photos. When `crosspix` detects `HTTP 403` on the legacy Library API, it automatically switches to the **Google Photos Picker API** (`photospicker.mediaitems.readonly`), opens the Google Photos Picker selection window in your browser, and downloads the selected photos.
 
-### 4. Immich (`immich`)
-Provide your Immich server API URL (default: `http://localhost:2283/api`) and API key via `--immich-url` and `--immich-key` (or `IMMICH_URL` and `IMMICH_API_KEY` environment variables). Uses `immichpy.AsyncClient` and `httpx`.
+1. In the [Google Cloud Console](https://console.cloud.google.com/), enable both **Google Photos Library API** and **Google Photos Picker API**.
+2. Under **OAuth consent screen / Audience**, add your Google email address to **Test users**.
+3. Create an OAuth 2.0 Client ID (**Desktop App**) and save the JSON file as `gphoto_oauth.json` in the project root.
+4. Synchronize:
+   ```bash
+   .venv/bin/python -m crosspix sync google_photos local:/home/goulu/Images/Photos --link-mode hardlink
+   ```
+
+#### B. Automatic Full Library + All Albums Import via Google Takeout
+To import 100% of your existing Google Photos library and 100% of your albums automatically without manual Picker selection:
+1. Export your **Google Photos** archive from [takeout.google.com](https://takeout.google.com/) and extract it.
+2. Run:
+   ```bash
+   .venv/bin/python -m crosspix sync google_photos local:/home/goulu/Images/Photos --google-takeout /path/to/Takeout --link-mode hardlink
+   ```
+   `crosspix` deduplicates every photo exported across multiple Takeout album folders into a single physical file in `_library/YYYY/MM/` and creates hardlinks in `albums/<word1>/<word2>/`.
 
 ---
 
-## Command-Line Usage
+### 3. Ente Photos (`ente`)
 
-### List Photos and Album Memberships
+#### Selective Synchronization with `ente-cli v0.4.5+` (Recommended)
+Unlike `ente photos export` (which refuses to export into a non-empty folder shared with other photo sources), `crosspix` queries `ente-cli` metadata in JSON and selectively downloads **only the photos not already present** in your target folder.
+
+1. **Install `ente-cli` (`v0.4.5+`) on Linux (`x86_64`)**:
+   ```bash
+   mkdir -p ~/.local/bin
+   curl -fL "https://github.com/ente/ente/releases/download/ente-cli-v0.4.5/ente-cli-v0.4.5-linux-amd64.tar.gz" \
+     | tar -xz -C ~/.local/bin
+   chmod +x ~/.local/bin/ente
+   ```
+2. **Log in to your Ente account once**:
+   ```bash
+   ~/.local/bin/ente account login --app photos
+   ```
+   *(If no account is logged in yet, `crosspix` will automatically prompt `ente account login --app photos` on first run).*
+3. **Synchronize all photos and albums selectively into `/home/goulu/Images/Photos`**:
+   ```bash
+   .venv/bin/python -m crosspix sync ente local:/home/goulu/Images/Photos --link-mode hardlink
+   ```
+   - To sync only a specific Ente album:
+     ```bash
+     .venv/bin/python -m crosspix sync ente local:/home/goulu/Images/Photos --album "Zermatt 2015" --link-mode hardlink
+     ```
+   - To preview without downloading (`--dry-run`):
+     ```bash
+     .venv/bin/python -m crosspix sync ente local:/home/goulu/Images/Photos --dry-run
+     ```
+
+---
+
+### 4. Immich (`immich`)
+Provide your Immich server API URL (default: `http://localhost:2283/api`) and API key via `--immich-url` and `--immich-key` (or `IMMICH_URL` and `IMMICH_API_KEY` environment variables):
 
 ```bash
-# List deduplicated photos and all their album memberships in a local directory
-crosspix list local:~/Pictures/Photos
+# Sync from Immich to local folder hierarchy
+.venv/bin/python -m crosspix sync immich local:/home/goulu/Images/Photos --immich-key YOUR_API_KEY --link-mode hardlink
 
-# List photos and albums on an Immich server
-crosspix list immich --immich-url http://localhost:2283/api --immich-key YOUR_API_KEY
-
-# List photos in a specific Google Photos album
-crosspix list google_photos --google-secret gphoto_oauth.json --album "Vacances 2026 Italie"
-```
-
-### Synchronize Photos Between Platforms
-
-```bash
-# Sync Google Photos (multi-album) to local folder hierarchy using hardlinks
-crosspix sync google_photos local:~/Pictures/Photos --link-mode hardlink
-
-# Sync Immich to local folder hierarchy using relative symlinks
-crosspix sync immich local:~/Pictures/Photos --immich-key YOUR_API_KEY --link-mode symlink
-
-# Sync local folder hierarchy to Immich (single upload per photo, attached to all matching albums)
-crosspix sync local:~/Pictures/Photos immich --immich-key YOUR_API_KEY
-
-# Sync local folder hierarchy to Ente Photos
-crosspix sync local:~/Pictures/Photos ente --ente-token YOUR_ENTE_TOKEN
-
-# Bi-directional sync between Google Photos and Immich
-crosspix sync google_photos immich --immich-key YOUR_API_KEY --bidirectional
-
-# Dry-run preview
-crosspix sync google_photos local:~/Pictures/Photos --dry-run
+# Sync from local folder hierarchy (Google Photos + Ente) to Immich
+.venv/bin/python -m crosspix sync local:/home/goulu/Images/Photos immich --immich-key YOUR_API_KEY
 ```
 
 ---
@@ -149,21 +166,15 @@ from crosspix import (
     PhotoSynchronizer,
 )
 
-# LocalProvider with _library/YYYY/MM/ + space-delimited albums/ hierarchy
 local = LocalProvider(
-    "~/Pictures/Photos",
+    "/home/goulu/Images/Photos",
     album_delimiter=" ",
-    link_mode="hardlink",  # "hardlink", "symlink", or "copy"
+    link_mode="hardlink",
 )
+ente = EnteProvider()
 
-immich = ImmichProvider(
-    base_url="http://localhost:2283/api",
-    api_key="your-immich-api-key",
-)
-
-# Synchronize between any two providers (Google Photos, Immich, Ente, Local)
-synchronizer = PhotoSynchronizer(dry_run=False, on_progress=print)
-result = synchronizer.sync(source=immich, target=local)
+synchronizer = PhotoSynchronizer(dry_run=False)
+result = synchronizer.sync(source=ente, target=local)
 
 print(
     f"Copied: {len(result.copied)}, "

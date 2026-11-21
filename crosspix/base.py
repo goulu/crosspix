@@ -44,9 +44,18 @@ class PhotoItem:
 
     def matches(self, other: "PhotoItem") -> bool:
         """Return True if two PhotoItems represent the same underlying photo."""
-        if self.checksum and other.checksum:
-            if self.checksum.lower() == other.checksum.lower():
-                return True
+        self_hashes = {
+            h.lower()
+            for h in (self.checksum, self.raw_metadata.get("sha512_b64"))
+            if isinstance(h, str) and h
+        }
+        other_hashes = {
+            h.lower()
+            for h in (other.checksum, other.raw_metadata.get("sha512_b64"))
+            if isinstance(h, str) and h
+        }
+        if self_hashes and other_hashes and (self_hashes & other_hashes):
+            return True
         if self.filename.lower() == other.filename.lower():
             if self.size and other.size and self.size == other.size:
                 return True

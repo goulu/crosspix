@@ -33,11 +33,14 @@ def build_provider(spec: str, args: argparse.Namespace) -> PhotoProvider:
             link_mode=args.link_mode,
         )
 
-    if kind in {"google", "google_photos", "gphotos"}:
+    if kind in {"google", "google_photos", "gphotos", "google_takeout"}:
+        if value and os.path.isdir(os.path.expanduser(value)):
+            return GooglePhotosProvider(takeout_dir=value)
         secret_file = value or args.google_secret
         return GooglePhotosProvider(
             client_secret_file=secret_file,
             access_token=os.environ.get("GOOGLE_PHOTOS_TOKEN"),
+            takeout_dir=args.google_takeout,
         )
 
     if kind == "ente":
@@ -48,6 +51,8 @@ def build_provider(spec: str, args: argparse.Namespace) -> PhotoProvider:
             export_dir=export_dir,
             album_delimiter=args.album_delimiter,
             link_mode=args.link_mode,
+            run_cli_export=args.ente_cli_sync,
+            account=args.ente_account,
         )
 
     if kind == "immich":
@@ -93,12 +98,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to Google Photos OAuth client secret JSON file.",
     )
     common.add_argument(
+        "--google-takeout",
+        help="Path to an extracted Google Takeout directory (imports all photos and all albums).",
+    )
+    common.add_argument(
         "--ente-api-url",
         default="https://api.ente.io",
         help="Ente Museum API URL.",
     )
     common.add_argument("--ente-token", help="Ente API authentication token.")
-    common.add_argument("--ente-export-dir", help="Local Ente CLI export directory.")
+    common.add_argument("--ente-export-dir", help="Local Ente Desktop / ente-cli export directory.")
+    common.add_argument("--ente-account", help="Optional account name for ente-cli (--account NAME).")
+    common.add_argument(
+        "--ente-cli-sync",
+        action="store_true",
+        help="Automatically run 'ente photos export DIR' via ente-cli before synchronizing.",
+    )
     common.add_argument(
         "--immich-url",
         default="http://localhost:2283/api",
@@ -135,39 +150,46 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _log(msg: str) -> None:
+    print(msg, flush=True)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     parser = build_parser()
     args = parser.parse_args(argv)
 
     try:
         if args.command == "list":
             provider = build_provider(args.provider, args)
+            _log(f"Connecting to {provider.platform_name}...")
             provider.connect()
             count = 0
             for item in provider.list_photos(album=args.album):
                 count += 1
                 dt_str = item.created_at.isoformat() if item.created_at else "unknown-date"
                 albums_str = f", albums={item.albums}" if item.albums else ""
-                print(
+                _log(
                     f"[{item.platform}] {item.filename} (id={item.id}, date={dt_str}{albums_str})"
                 )
-            print(f"Total photos listed: {count}")
+            _log(f"Total photos listed: {count}")
             return 0
 
         if args.command == "sync":
             source = build_provider(args.source, args)
             target = build_provider(args.target, args)
-            synchronizer = PhotoSynchronizer(dry_run=args.dry_run, on_progress=print)
+            synchronizer = PhotoSynchronizer(dry_run=args.dry_run, on_progress=_log)
 
             if args.bidirectional:
                 res_ab, res_ba = synchronizer.bisync(source, target, album=args.album)
-                print(
+                _log(
                     f"Bi-sync complete: {len(res_ab.copied)} copied {source.platform_name}->{target.platform_name}, "
                     f"{len(res_ba.copied)} copied {target.platform_name}->{source.platform_name}."
                 )
             else:
                 res = synchronizer.sync(source, target, album=args.album)
-                print(
+                _log(
                     f"Sync complete: {len(res.copied)} copied, "
                     f"{len(res.albums_updated)} album-linked, "
                     f"{len(res.skipped)} skipped, "
@@ -175,7 +197,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 )
             return 0
     except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        print(f"Error: {exc}", file=sys.stderr, flush=True)
         return 1
 
     return 0

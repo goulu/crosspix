@@ -1,4 +1,4 @@
-"""Ente Photos provider using PyNaCl (libsodium E2EE), httpx, requests, and optional local export folder."""
+"""Ente Photos provider using PyNaCl (libsodium E2EE), httpx, requests, ente-cli selective download, or local export folder."""
 
 from __future__ import annotations
 
@@ -6,8 +6,11 @@ import base64
 from datetime import datetime
 import hashlib
 import json
+import mimetypes
 from pathlib import Path
-from typing import Any, Iterable, Optional
+import shutil
+import subprocess
+from typing import Any, Callable, Iterable, Optional
 
 import httpx
 import nacl.secret
@@ -18,12 +21,23 @@ from crosspix.base import PhotoItem, PhotoProvider
 from crosspix.local import LinkMode, LocalProvider
 
 DEFAULT_ENTE_API_URL = "https://api.ente.io"
+_ENTE_SYSTEM_ALBUMS = {"uncategorized", "trash", "corbeille", "archive", "hidden"}
+_ENTE_TRASH_ALBUMS = {"trash", "corbeille"}
+
+
+def _default_log(msg: str) -> None:
+    print(msg, flush=True)
 
 
 class EnteProvider(PhotoProvider):
-    """Photo provider for Ente Photos (E2EE Museum API via PyNaCl + httpx/requests or Ente export folder).
+    """Photo provider for Ente Photos.
 
-    Supports multi-album (multi-collection) deduplication and space-delimited folder hierarchies.
+    Supports three modes:
+    1. Selective CLI mode (`ente-cli v0.4.5+`): Lists all albums and files as JSON via
+       `ente photos album list --all --json` and `ente photos file list --all --json`,
+       and downloads ONLY the photos missing from the target via `ente photos file download`.
+    2. Local export directory mirror (`export_dir` without `run_cli_export`).
+    3. Direct Ente Museum HTTP API (`auth_token` + PyNaCl E2EE).
     """
 
     platform_name = "ente"
@@ -37,6 +51,9 @@ class EnteProvider(PhotoProvider):
         http_client: Optional[httpx.Client] = None,
         album_delimiter: str = " ",
         link_mode: LinkMode = "hardlink",
+        run_cli_export: bool = False,
+        account: Optional[str] = None,
+        on_progress: Optional[Callable[[str], None]] = _default_log,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.auth_token = auth_token
@@ -50,28 +67,82 @@ class EnteProvider(PhotoProvider):
         self.http_client = http_client or httpx.Client(timeout=60.0)
         self.album_delimiter = album_delimiter
         self.link_mode: LinkMode = link_mode
+        self.run_cli_export = run_cli_export
+        self.account = account
+        self.on_progress = on_progress
+
+        # Use local mirror only when export_dir is specified without run_cli_export
         self._local_mirror = (
             LocalProvider(
                 self.export_dir,
                 recursive=True,
                 album_delimiter=album_delimiter,
                 link_mode=link_mode,
+                on_progress=on_progress,
             )
-            if self.export_dir
+            if (self.export_dir and not self.run_cli_export)
             else None
         )
+        self._use_cli: bool = False
+        self._ente_bin: Optional[str] = None
         self._collection_cache: dict[str, int] = {}
 
+    def _log(self, message: str) -> None:
+        if self.on_progress is not None:
+            self.on_progress(message)
+
+    @staticmethod
+    def _find_ente_binary() -> Optional[str]:
+        ente_bin = shutil.which("ente")
+        if ente_bin:
+            return ente_bin
+        fallback = Path.home() / ".local" / "bin" / "ente"
+        if fallback.exists():
+            return str(fallback)
+        return None
+
     def connect(self) -> None:
-        """Initialize connection to Ente API or local Ente CLI export directory."""
+        """Initialize connection to Ente CLI, local export folder, or Ente Museum API."""
         if self._local_mirror is not None:
             self._local_mirror.connect()
+            self._log(f"[Ente] Connected to Ente export directory: {self.export_dir}")
             return
-        if not self.auth_token:
-            raise ValueError(
-                "EnteProvider requires either an 'auth_token' for the Ente API "
-                "or an 'export_dir' managed by ente-cli."
+
+        if self.auth_token:
+            self._log(f"[Ente] Connected to Ente API ({self.api_url}).")
+            return
+
+        ente_bin = self._find_ente_binary()
+        if ente_bin or self.run_cli_export:
+            if not ente_bin:
+                raise RuntimeError(
+                    "The 'ente' CLI binary was not found in PATH or ~/.local/bin/ente."
+                )
+            self._ente_bin = ente_bin
+            self._use_cli = True
+
+            acct_check = subprocess.run(
+                [ente_bin, "account", "list"],
+                capture_output=True,
+                text=True,
+                check=False,
             )
+            if "No accounts on this device" in (acct_check.stdout + acct_check.stderr):
+                self._log(
+                    "[Ente] No account logged in to ente-cli yet. Launching 'ente account login --app photos'..."
+                )
+                login_cmd = [ente_bin, "account", "login", "--app", "photos"]
+                if self.account:
+                    login_cmd.extend(["--account", self.account])
+                subprocess.run(login_cmd, check=True)
+
+            self._log(f"[Ente] Connected via ente-cli ({ente_bin}).")
+            return
+
+        raise ValueError(
+            "EnteProvider requires either ente-cli installed, an 'auth_token' for the Ente API, "
+            "or an 'export_dir'."
+        )
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -105,7 +176,6 @@ class EnteProvider(PhotoProvider):
         created_at: Optional[datetime] = None
         creation_usec = metadata.get("creationTime") or raw.get("creationTime")
         if isinstance(creation_usec, (int, float)):
-            # Ente timestamps are stored in microseconds
             ts = creation_usec / 1_000_000 if creation_usec > 1e12 else creation_usec
             created_at = datetime.fromtimestamp(ts)
 
@@ -132,6 +202,126 @@ class EnteProvider(PhotoProvider):
             albums=all_albums,
             raw_metadata=raw,
         )
+
+    def _list_via_cli(self, album: Optional[str] = None) -> Iterable[PhotoItem]:
+        """List all albums and files via ente-cli JSON commands without bulk-exporting files."""
+        assert self._ente_bin is not None
+        acct_args = ["--account", self.account] if self.account else []
+
+        self._log("[Ente] Fetching album list via 'ente photos album list --all --json'...")
+        alb_cmd = [self._ente_bin, "photos", "album", "list", "--all", "--json", *acct_args]
+        alb_proc = subprocess.run(alb_cmd, capture_output=True, text=True, check=True)
+        raw_albums = json.loads(alb_proc.stdout)
+
+        album_id_to_name: dict[str, str] = {}
+        trash_album_ids: set[str] = set()
+        for alb in raw_albums:
+            if not isinstance(alb, dict):
+                continue
+            aid = str(alb.get("id", ""))
+            name = str(alb.get("name", "")).strip()
+            alb_type = str(alb.get("type", "")).lower()
+            if not aid or not name:
+                continue
+            if name.lower() in _ENTE_TRASH_ALBUMS or alb_type == "trash":
+                trash_album_ids.add(aid)
+                continue
+            if name.lower() in _ENTE_SYSTEM_ALBUMS or alb_type in {"uncategorized", "defaulthidden"}:
+                continue
+            album_id_to_name[aid] = name
+
+        self._log(
+            f"[Ente] Found {len(album_id_to_name)} user album(s). Fetching file metadata list..."
+        )
+        file_cmd = [
+            self._ente_bin,
+            "photos",
+            "file",
+            "list",
+            "--all",
+            "--json",
+            "--offline",
+            *acct_args,
+        ]
+        if album:
+            file_cmd.extend(["--album", album])
+
+        file_proc = subprocess.run(file_cmd, capture_output=True, text=True, check=False)
+        if file_proc.returncode != 0:
+            # Retry without --offline if local metadata cache was not populated yet
+            file_cmd_online = [arg for arg in file_cmd if arg != "--offline"]
+            file_proc = subprocess.run(
+                file_cmd_online, capture_output=True, text=True, check=True
+            )
+
+        raw_files = json.loads(file_proc.stdout)
+        self._log(f"[Ente] Loaded metadata for {len(raw_files)} file entry/entries from Ente.")
+
+        dedup_items: dict[str, PhotoItem] = {}
+        for raw in raw_files:
+            if not isinstance(raw, dict):
+                continue
+            file_id = str(raw.get("id", ""))
+            filename = str(raw.get("name") or f"ente_{file_id}.jpg")
+            alb_ids = [str(a) for a in raw.get("albumIds", []) if a is not None]
+
+            # Skip files that only exist in Trash/Corbeille
+            if alb_ids and all(aid in trash_album_ids for aid in alb_ids):
+                continue
+
+            item_albums = [
+                album_id_to_name[aid]
+                for aid in alb_ids
+                if aid in album_id_to_name
+            ]
+            if album and album not in item_albums:
+                item_albums.append(album)
+
+            created_at: Optional[datetime] = None
+            dt_str = raw.get("dateTime") or raw.get("createdAt")
+            if isinstance(dt_str, str):
+                try:
+                    created_at = datetime.fromisoformat(
+                        dt_str.replace("Z", "+00:00")
+                    ).replace(tzinfo=None)
+                except ValueError:
+                    pass
+
+            hash_val = raw.get("hash")
+            if isinstance(hash_val, str) and ":" in hash_val:
+                # For Live Photos, Ente stores "image_hash:video_hash"
+                hash_val = hash_val.split(":", 1)[0]
+
+            mime_type, _ = mimetypes.guess_type(filename)
+            raw_meta = {**raw}
+            if isinstance(hash_val, str) and hash_val:
+                raw_meta["sha512_b64"] = hash_val
+
+            dedup_key = (
+                hash_val
+                if isinstance(hash_val, str) and hash_val
+                else f"{filename}:{raw.get('sizeBytes')}:{created_at}:{file_id}"
+            )
+            if dedup_key in dedup_items:
+                for alb_name in item_albums:
+                    dedup_items[dedup_key].add_album(alb_name)
+            else:
+                dedup_items[dedup_key] = PhotoItem(
+                    id=file_id,
+                    filename=filename,
+                    platform=self.platform_name,
+                    checksum=hash_val if isinstance(hash_val, str) else None,
+                    created_at=created_at,
+                    size=raw.get("sizeBytes"),
+                    width=raw.get("width"),
+                    height=raw.get("height"),
+                    mime_type=mime_type or "image/jpeg",
+                    album=item_albums[0] if item_albums else None,
+                    albums=item_albums,
+                    raw_metadata=raw_meta,
+                )
+
+        yield from dedup_items.values()
 
     def _resolve_collection_id(
         self, collection_name: str, create_if_missing: bool = False
@@ -182,11 +372,20 @@ class EnteProvider(PhotoProvider):
         resp.raise_for_status()
 
     def list_photos(self, album: Optional[str] = None) -> Iterable[PhotoItem]:
-        """Yield deduplicated PhotoItems from Ente export folder or Ente Museum API."""
+        """Yield deduplicated PhotoItems from Ente CLI, local export folder, or Ente Museum API."""
         if self._local_mirror is not None:
+            self._log(f"[Ente] Scanning Ente export folder '{self.export_dir}'...")
             for item in self._local_mirror.list_photos(album=album):
                 item.platform = self.platform_name
+                item.albums = [
+                    a for a in item.albums if a.lower() not in _ENTE_SYSTEM_ALBUMS
+                ]
+                item.album = item.albums[0] if item.albums else None
                 yield item
+            return
+
+        if self._use_cli:
+            yield from self._list_via_cli(album=album)
             return
 
         resp = self.http_client.get(
@@ -226,12 +425,30 @@ class EnteProvider(PhotoProvider):
         yield from dedup_items.values()
 
     def download_photo(self, item: PhotoItem, destination_dir: Path) -> Path:
-        """Download and decrypt a photo from Ente into destination_dir."""
+        """Download and decrypt a single photo from Ente into destination_dir."""
         destination_dir = Path(destination_dir).expanduser().resolve()
         destination_dir.mkdir(parents=True, exist_ok=True)
 
         if self._local_mirror is not None and item.local_path:
             return self._local_mirror.download_photo(item, destination_dir)
+
+        if self._use_cli and self._ente_bin:
+            target_path = destination_dir / item.filename
+            if target_path.exists():
+                target_path.unlink()
+            acct_args = ["--account", self.account] if self.account else []
+            dl_cmd = [
+                self._ente_bin,
+                "photos",
+                "file",
+                "download",
+                "--output",
+                str(target_path),
+                *acct_args,
+                str(item.id),
+            ]
+            subprocess.run(dl_cmd, check=True)
+            return target_path
 
         download_url = item.raw_metadata.get("downloadUrl") or (
             f"{self.api_url}/files/download/{item.id}"

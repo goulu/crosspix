@@ -355,3 +355,39 @@ def test_immich_provider_multi_album_upload_and_sync_albums(tmp_path: Path) -> N
     provider.sync_albums(uploaded, ["Favoris 2026"])
     assert "Favoris 2026" in uploaded.albums
     assert mock_http.put.call_count == 3
+
+
+def test_in_place_ente_export_deduplication_and_hierarchy(tmp_path: Path) -> None:
+    """When Ente exports directly into /home/goulu/Images/Photos, crosspix deduplicates in-place."""
+    photos_dir = tmp_path / "Photos"
+    # Simulate Ente CLI exporting the same photo into two flat album folders (two different inodes)
+    flat_alb1 = photos_dir / "Vacances 2026 Italie" / "colisee.jpg"
+    flat_alb2 = photos_dir / "Famille Eté" / "colisee.jpg"
+    _create_sample_jpeg(flat_alb1, "2026:08:10 14:00:00", (120, 80, 60))
+    flat_alb2.parent.mkdir(parents=True, exist_ok=True)
+    flat_alb2.write_bytes(flat_alb1.read_bytes())
+
+    assert flat_alb1.stat().st_ino != flat_alb2.stat().st_ino
+
+    ente_src = EnteProvider(export_dir=photos_dir, album_delimiter=" ", link_mode="hardlink")
+    local_dst = LocalProvider(photos_dir, album_delimiter=" ", link_mode="hardlink")
+
+    synchronizer = PhotoSynchronizer()
+    res = synchronizer.sync(ente_src, local_dst)
+
+    assert len(res.albums_updated) == 1
+    canonical = photos_dir / "_library" / "2026" / "08" / "colisee.jpg"
+    hier_alb1 = photos_dir / "albums" / "Vacances" / "2026" / "Italie" / "colisee.jpg"
+    hier_alb2 = photos_dir / "albums" / "Famille" / "Eté" / "colisee.jpg"
+
+    assert canonical.exists()
+    assert hier_alb1.exists()
+    assert hier_alb2.exists()
+
+    # All 5 paths (canonical, 2 hierarchical album links, and 2 flat Ente folders) now share 1 single inode!
+    ino = canonical.stat().st_ino
+    assert hier_alb1.stat().st_ino == ino
+    assert hier_alb2.stat().st_ino == ino
+    assert flat_alb1.stat().st_ino == ino
+    assert flat_alb2.stat().st_ino == ino
+

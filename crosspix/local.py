@@ -7,13 +7,15 @@ delimiter (`" "`) by default to map flat remote album names to local folder tree
 
 from __future__ import annotations
 
+import base64
 from datetime import datetime
 import hashlib
+import json
 import mimetypes
 import os
 from pathlib import Path
 import shutil
-from typing import Any, Iterable, Literal, Optional
+from typing import Any, Callable, Iterable, Literal, Optional
 
 import piexif
 from PIL import ExifTags, Image
@@ -31,6 +33,13 @@ SUPPORTED_EXTENSIONS = {
     ".tiff",
     ".tif",
     ".bmp",
+    ".mp4",
+    ".mov",
+    ".m4v",
+    ".3gp",
+    ".avi",
+    ".mkv",
+    ".zip",
 }
 
 LinkMode = Literal["hardlink", "symlink", "copy"]
@@ -58,6 +67,7 @@ class LocalProvider(PhotoProvider):
         album_delimiter: str = " ",
         link_mode: LinkMode = "hardlink",
         use_library_layout: bool = True,
+        on_progress: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.root_dir = Path(root_dir).expanduser().resolve()
         self.recursive = recursive
@@ -66,6 +76,13 @@ class LocalProvider(PhotoProvider):
         self.album_delimiter = album_delimiter
         self.link_mode: LinkMode = link_mode
         self.use_library_layout = use_library_layout
+        self.on_progress = on_progress
+
+    def _log(self, message: str) -> None:
+        if self.on_progress is not None:
+            self.on_progress(message)
+        else:
+            print(message, flush=True)
 
     @property
     def library_root(self) -> Path:
@@ -115,6 +132,17 @@ class LocalProvider(PhotoProvider):
         return digest.hexdigest()
 
     @staticmethod
+    def compute_hashes(file_path: Path) -> tuple[str, str]:
+        """Compute both (sha256_hex, sha512_base64) of a local file in a single pass."""
+        h256 = hashlib.sha256()
+        h512 = hashlib.sha512()
+        with file_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                h256.update(chunk)
+                h512.update(chunk)
+        return h256.hexdigest(), base64.b64encode(h512.digest()).decode("ascii")
+
+    @staticmethod
     def extract_image_metadata(
         file_path: Path,
     ) -> tuple[Optional[int], Optional[int], Optional[datetime], dict[str, Any]]:
@@ -153,6 +181,36 @@ class LocalProvider(PhotoProvider):
             pass
 
         if created_at is None:
+            # Check Ente (metadata/<filename>.json) or Google Takeout (<filename>.json) sidecar metadata
+            sidecar_candidates = [
+                file_path.parent / "metadata" / f"{file_path.name}.json",
+                file_path.with_name(f"{file_path.name}.json"),
+                file_path.with_name(f"{file_path.name}.supplemental-metadata.json"),
+            ]
+            for sidecar in sidecar_candidates:
+                if sidecar.is_file():
+                    try:
+                        meta_json = json.loads(sidecar.read_text(encoding="utf-8"))
+                        ts_info = (
+                            meta_json.get("photoTakenTime")
+                            or meta_json.get("creationTime")
+                            or {}
+                        )
+                        ts_val = (
+                            ts_info.get("timestamp")
+                            if isinstance(ts_info, dict)
+                            else ts_info
+                        )
+                        if ts_val is not None:
+                            ts_float = float(ts_val)
+                            if ts_float > 1e12:
+                                ts_float /= 1_000_000.0
+                            created_at = datetime.fromtimestamp(ts_float)
+                            break
+                    except Exception:
+                        pass
+
+        if created_at is None:
             stat = file_path.stat()
             created_at = datetime.fromtimestamp(stat.st_mtime)
 
@@ -167,6 +225,10 @@ class LocalProvider(PhotoProvider):
         if parts[0] == self.library_dirname:
             return None
 
+        # Ignore Ente metadata sidecar folders if any image happens to be inside
+        if "metadata" in parts[:-1]:
+            return None
+
         # Files inside `albums/<level1>/<level2>/<file>`
         if parts[0] == self.albums_dirname:
             if len(parts) <= 2:
@@ -174,19 +236,28 @@ class LocalProvider(PhotoProvider):
             album_rel_dir = Path(*parts[1:-1])
             return self.relpath_to_album(album_rel_dir)
 
-        # Fallback for direct folder structures without `albums/` prefix
+        # Fallback for direct folder structures without `albums/` prefix (e.g. Ente export folders)
         if len(parts) > 1:
             return self.relpath_to_album(Path(*parts[:-1]))
         return None
 
     def _build_photo_item(
-        self, canonical_path: Path, albums: list[str], checksum: str
+        self,
+        canonical_path: Path,
+        albums: list[str],
+        checksum: str,
+        all_paths: Optional[list[Path]] = None,
     ) -> PhotoItem:
         stat = canonical_path.stat()
         width, height, created_at, exif_meta = self.extract_image_metadata(canonical_path)
         mime_type, _ = mimetypes.guess_type(canonical_path.name)
         rel_path = canonical_path.relative_to(self.root_dir)
         sorted_albums = sorted(dict.fromkeys(albums))
+        if all_paths is not None:
+            exif_meta = {
+                **exif_meta,
+                "_all_paths": [str(p) for p in all_paths],
+            }
 
         return PhotoItem(
             id=str(rel_path),
@@ -216,8 +287,8 @@ class LocalProvider(PhotoProvider):
 
         iterator = self.root_dir.rglob("*") if self.recursive else self.root_dir.glob("*")
 
-        # Group by (inode_key or sha256) so hardlinks & symlinks never duplicate items
-        inode_to_checksum: dict[tuple[int, int], str] = {}
+        inode_to_hashes: dict[tuple[int, int], tuple[str, str]] = {}
+        checksum_to_sha512: dict[str, str] = {}
         grouped_paths: dict[str, list[Path]] = {}
 
         for path in sorted(iterator):
@@ -232,10 +303,12 @@ class LocalProvider(PhotoProvider):
             resolved = path.resolve()
             st = resolved.stat()
             inode_key = (st.st_dev, st.st_ino)
-            checksum = inode_to_checksum.get(inode_key)
-            if checksum is None:
-                checksum = self.compute_sha256(resolved)
-                inode_to_checksum[inode_key] = checksum
+            hashes = inode_to_hashes.get(inode_key)
+            if hashes is None:
+                hashes = self.compute_hashes(resolved)
+                inode_to_hashes[inode_key] = hashes
+            checksum, sha512_b64 = hashes
+            checksum_to_sha512[checksum] = sha512_b64
 
             grouped_paths.setdefault(checksum, []).append(path)
 
@@ -259,7 +332,9 @@ class LocalProvider(PhotoProvider):
             if album and album not in albums:
                 continue
 
-            yield self._build_photo_item(canonical_path, albums, checksum)
+            item = self._build_photo_item(canonical_path, albums, checksum, all_paths=paths)
+            item.raw_metadata["sha512_b64"] = checksum_to_sha512[checksum]
+            yield item
 
     def _canonical_library_path(self, filename: str, created_at: Optional[datetime]) -> Path:
         """Compute the canonical `_library/YYYY/MM/<filename>` path for a photo."""
@@ -353,14 +428,29 @@ class LocalProvider(PhotoProvider):
 
         canonical_path.parent.mkdir(parents=True, exist_ok=True)
         if file_path.resolve() != canonical_path.resolve():
-            shutil.copy2(file_path, canonical_path)
+            if self.link_mode == "hardlink":
+                try:
+                    if canonical_path.exists():
+                        canonical_path.unlink()
+                    os.link(file_path, canonical_path)
+                except OSError:
+                    shutil.copy2(file_path, canonical_path)
+            else:
+                shutil.copy2(file_path, canonical_path)
+            self._log(
+                f"[Local] Stored canonical file: {canonical_path.relative_to(self.root_dir)}"
+            )
 
         if created_at:
             ts = created_at.timestamp()
             os.utime(canonical_path, (ts, ts))
 
         for alb in target_albums:
-            self._create_album_link(canonical_path, alb)
+            link_path = self._create_album_link(canonical_path, alb)
+            self._log(
+                f"[Local] Linked ({self.link_mode}): {link_path.relative_to(self.root_dir)} -> "
+                f"{canonical_path.relative_to(self.root_dir)}"
+            )
 
         checksum = (
             item.checksum
@@ -369,14 +459,102 @@ class LocalProvider(PhotoProvider):
         )
         return self._build_photo_item(canonical_path, target_albums, checksum)
 
-    def sync_albums(self, item: PhotoItem, albums: Iterable[str]) -> PhotoItem:
-        """Create hardlinks/symlinks in additional album folders for an existing local photo."""
-        canonical_path = item.local_path or (self.root_dir / item.id)
-        if not canonical_path.exists():
-            raise FileNotFoundError(f"Local canonical file not found: {canonical_path}")
+    def needs_organization(self, item: PhotoItem, desired_albums: Iterable[str]) -> bool:
+        """Return True if an existing photo needs canonical _library placement, album links, or inode deduplication."""
+        source_path = item.local_path or (self.root_dir / item.id)
+        if not source_path.exists():
+            return False
 
-        for alb in albums:
-            if alb:
-                self._create_album_link(canonical_path, alb)
-                item.add_album(alb)
+        expected_canonical = self._canonical_library_path(item.filename, item.created_at)
+        if self.use_library_layout and not expected_canonical.exists():
+            return True
+
+        canonical_ino = (
+            expected_canonical.stat().st_ino
+            if expected_canonical.exists()
+            else source_path.stat().st_ino
+        )
+
+        all_albums = set(item.albums) | {a for a in desired_albums if a}
+        for alb in all_albums:
+            album_rel_dir = self.album_to_relpath(alb)
+            album_dir = (
+                self.albums_root / album_rel_dir
+                if self.use_library_layout
+                else self.root_dir / album_rel_dir
+            )
+            link_path = album_dir / item.filename
+            if not (link_path.exists() or link_path.is_symlink()):
+                return True
+            if (
+                self.link_mode == "hardlink"
+                and not link_path.is_symlink()
+                and link_path.stat().st_ino != canonical_ino
+            ):
+                return True
+
+        # Check if multiple physical copies exist (e.g. exported by Ente into several flat album folders)
+        if self.link_mode == "hardlink":
+            raw_paths = item.raw_metadata.get("_all_paths", [])
+            for p_str in raw_paths:
+                p = Path(p_str)
+                if p.exists() and not p.is_symlink() and p.stat().st_ino != canonical_ino:
+                    return True
+
+        return False
+
+    def sync_albums(self, item: PhotoItem, albums: Iterable[str]) -> PhotoItem:
+        """Ensure canonical _library file exists, create hierarchical album links, and deduplicate inodes."""
+        source_path = item.local_path or (self.root_dir / item.id)
+        if not source_path.exists():
+            raise FileNotFoundError(f"Local file not found: {source_path}")
+
+        canonical_path = self._canonical_library_path(item.filename, item.created_at)
+        if self.use_library_layout and canonical_path.resolve() != source_path.resolve():
+            canonical_path.parent.mkdir(parents=True, exist_ok=True)
+            if not canonical_path.exists():
+                if self.link_mode == "hardlink":
+                    try:
+                        os.link(source_path, canonical_path)
+                    except OSError:
+                        shutil.copy2(source_path, canonical_path)
+                else:
+                    shutil.copy2(source_path, canonical_path)
+                self._log(
+                    f"[Local] Linked canonical file: {canonical_path.relative_to(self.root_dir)}"
+                )
+            item.local_path = canonical_path
+            item.id = str(canonical_path.relative_to(self.root_dir))
+        else:
+            canonical_path = source_path
+
+        all_albums = list(dict.fromkeys([*item.albums, *(a for a in albums if a)]))
+        for alb in all_albums:
+            link_path = self._create_album_link(canonical_path, alb)
+            item.add_album(alb)
+            self._log(
+                f"[Local] Linked ({self.link_mode}): {link_path.relative_to(self.root_dir)} -> "
+                f"{canonical_path.relative_to(self.root_dir)}"
+            )
+
+        # Replace any duplicate physical copies (e.g. in flat Ente export folders) with hardlinks to canonical_path
+        if self.link_mode == "hardlink":
+            canonical_ino = canonical_path.stat().st_ino
+            for p_str in item.raw_metadata.get("_all_paths", []):
+                p = Path(p_str)
+                if (
+                    p.exists()
+                    and not p.is_symlink()
+                    and p.resolve() != canonical_path.resolve()
+                    and p.stat().st_ino != canonical_ino
+                ):
+                    try:
+                        p.unlink()
+                        os.link(canonical_path, p)
+                        self._log(
+                            f"[Local] Deduplicated in-place with hardlink: {p.relative_to(self.root_dir)}"
+                        )
+                    except OSError:
+                        pass
+
         return item
