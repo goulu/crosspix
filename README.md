@@ -56,10 +56,10 @@ Photos/
 
 | Provider | Module | PyPI Packages | Synchronization & Multi-Album Behavior |
 | :--- | :--- | :--- | :--- |
-| **Local Folders** | `crosspix/local.py` | `Pillow` (`PIL`), `piexif` | Stores canonical files in `_library/YYYY/MM/`; links into `albums/<part1>/<part2>/` via `os.link` (hardlink) or `os.symlink`; deduplicates by inode, `SHA-256`, and `SHA-512` (Base64); reads EXIF and Ente/Takeout sidecar JSON timestamps. |
+| **Local Folders** | `crosspix/local.py` | `Pillow` (`PIL`), `piexif` | Stores canonical files in `_library/YYYY/MM/`; links into `albums/<part1>/<part2>/` via `os.link` (hardlink) or `os.symlink`; supports `--albums-only` to scan only `albums/` (skipping `_library/`, `.meta/`, and `metadata/`); deduplicates by inode, `SHA-256`, `SHA-512` (Base64), and `SHA-1` (Base64); reads EXIF and Ente/Takeout sidecar JSON timestamps. |
 | **Google Photos** | `crosspix/google_photos.py` | `gphotospy`, `google-api-python-client`, `google-auth-oauthlib`, `requests` | Supports OAuth2 Library API + automatic fallback to the **Google Photos Picker API** (`photospicker.googleapis.com` for post-March 2025 scopes), plus full automatic import of photos & albums from a **Google Takeout** directory (`--google-takeout`). |
 | **Ente Photos** | `crosspix/ente.py` | `PyNaCl` (`nacl`), `httpx`, `requests` | **Selective CLI mode (`ente-cli v0.4.5+`)**: fetches album/file metadata & `SHA-512` hashes via `ente photos album list --all --json` and `ente photos file list --all --json --offline`, and downloads **only missing files** via `ente photos file download`. Also supports local export folders and the E2EE Museum API. |
-| **Immich** | `crosspix/immich.py` | `immichpy`, `httpx` | Enriches assets from `search_assets` with album memberships via `get_all_albums`; uploads once via `POST /assets` and attaches to all albums via `PUT /albums/{id}/assets`. |
+| **Immich** | `crosspix/immich.py` | `immichpy`, `httpx` | Paginates `search_assets` and enriches album memberships via `get_all_albums`; matches local assets by Immich's native `SHA-1` Base64 checksum (`x-immich-checksum`); uploads once via `POST /assets` and attaches to all albums via `PUT /albums/{id}/assets`. |
 
 ---
 
@@ -83,6 +83,7 @@ pip install -e ".[dev]"
 ### 1. Local Folders (`local:/path/to/photos`)
 - `--album-delimiter " "` (default: space `" "`): splits remote album names into nested local directories under `albums/` and joins nested folder names back into remote album titles.
 - `--link-mode {hardlink,symlink,copy}` (default: `hardlink`): controls how files in `albums/...` reference the canonical file in `_library/YYYY/MM/`.
+- `--albums-only`: when reading from a local source, scans only `albums/` (ignoring unlinked files in `_library/`, hidden directories such as `.meta/`, and `metadata/`). Hardlinked photos shared across multiple albums are still uploaded once and linked to all their albums.
 
 ---
 
@@ -143,14 +144,56 @@ Unlike `ente photos export` (which refuses to export into a non-empty folder sha
 ---
 
 ### 4. Immich (`immich`)
-Provide your Immich server API URL (default: `http://localhost:2283/api`) and API key via `--immich-url` and `--immich-key` (or `IMMICH_URL` and `IMMICH_API_KEY` environment variables):
+Provide your Immich server URL (default: `http://localhost:2283/api`; `/api` is appended automatically if omitted) and API key in one of three ways (checked in this order):
+1. `--immich-key YOUR_API_KEY`
+2. `IMMICH_API_KEY` environment variable
+3. A gitignored local token file (`immich.token` by default, or `--immich-key-file PATH`; blank lines and `#` comments are ignored).
 
 ```bash
 # Sync from Immich to local folder hierarchy
-.venv/bin/python -m crosspix sync immich local:/home/goulu/Images/Photos --immich-key YOUR_API_KEY --link-mode hardlink
+.venv/bin/python -m crosspix sync immich:http://localhost:2283 local:/home/goulu/Images/Photos --link-mode hardlink
 
-# Sync from local folder hierarchy (Google Photos + Ente) to Immich
-.venv/bin/python -m crosspix sync local:/home/goulu/Images/Photos immich --immich-key YOUR_API_KEY
+# Sync full local library + albums to Immich (reads API key from immich.token)
+.venv/bin/python -m crosspix sync local:/home/goulu/Images/Ente immich:http://localhost:2283
+
+# Sync ONLY albums and their photos to Immich (skip unlinked photos in _library/)
+.venv/bin/python -m crosspix sync local:/home/goulu/Images/Ente immich:http://localhost:2283 --albums-only
+```
+
+---
+
+## Maintenance Scripts (`scripts/`)
+
+### 1. Migrate an Ente Export Directory (`scripts/migrate_ente_folder.py`)
+Sequentially reorganizes a flat Ente export directory into crosspix's `_library/YYYY/MM/` and hierarchical `albums/` layout without building a global catalog in memory:
+- Streams directory-by-directory (`os.walk`) with live terminal progress.
+- Deduplicates locally against `_library/YYYY/MM/` (fast inode/size checks before SHA-256) and creates space-delimited album hardlinks.
+- Moves remaining non-media files (e.g. `.gpx`, `.txt`) and auxiliary hidden folders (e.g. `.meta`) into the corresponding `albums/...` directory.
+- Cleans up processed sidecar JSONs and empty legacy directories as it goes.
+
+```bash
+# Preview changes without modifying disk
+.venv/bin/python scripts/migrate_ente_folder.py /home/goulu/Images/Ente --dry-run
+
+# Reorganize in-place
+.venv/bin/python scripts/migrate_ente_folder.py /home/goulu/Images/Ente
+```
+
+### 2. Deduplicate Variant Copies in `_library` (`scripts/deduplicate_library_variants.py`)
+Cleans up redundant variant copies within each `_library/YYYY/MM/` folder and repairs all affected links in `albums/` in two fast sequential phases:
+- **Supported variants**: Flickr originals (`_<id>_o`), Google Photos edits (`-modifié`, `-edited`), hash-disambiguated copies (`_<8hex>`), and numbered copies (`(1)`, `(2)`).
+- **Priority**: keeps `_<id>_o` first, then `-modifié`, then highest resolution (`width × height`) and largest file size, and renames the kept copy to its short base name.
+- **Safety**: uses perceptual 64-bit `dHash` clustering for multi-`_o`, `_<8hex>`, and `(N)` groups so visually distinct photos sharing a title or filename are preserved untouched.
+- **Phase 2 (`albums/`)**: scans each album folder sequentially via `os.scandir`, updating/rebuilding hardlinks and symlinks (including broken symlinks and orphaned `nlink == 1` hardlinks).
+
+```bash
+# Preview without modifying disk
+.venv/bin/python scripts/deduplicate_library_variants.py /home/goulu/Images/Ente --dry-run
+
+# Deduplicate _library and rebuild album links
+.venv/bin/python scripts/deduplicate_library_variants.py /home/goulu/Images/Ente
+
+# Optional flags: --rename-standalone, --skip-albums, --albums-only, --verbose
 ```
 
 ---
@@ -188,7 +231,7 @@ print(
 ## Running Tests
 
 ```bash
-.venv/bin/pytest -v
+.venv/bin/python -m pytest -v
 ```
 
 ---

@@ -15,6 +15,25 @@ from crosspix.local import LocalProvider
 from crosspix.sync import PhotoSynchronizer
 
 
+def _read_key_file(path_str: str) -> str:
+    """Read an API key from a local file, ignoring blank lines and `#` comments."""
+    if not path_str:
+        return ""
+    path = os.path.expanduser(path_str)
+    if not os.path.isfile(path):
+        return ""
+    with open(path, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line and line.split("=", 1)[0].strip().upper() == "IMMICH_API_KEY":
+                line = line.split("=", 1)[1].strip().strip("\"'")
+            if line:
+                return line
+    return ""
+
+
 def build_provider(spec: str, args: argparse.Namespace) -> PhotoProvider:
     """Instantiate a PhotoProvider from a specification string like 'local:/path' or 'immich'."""
     if ":" in spec:
@@ -31,6 +50,7 @@ def build_provider(spec: str, args: argparse.Namespace) -> PhotoProvider:
             root_dir=path,
             album_delimiter=args.album_delimiter,
             link_mode=args.link_mode,
+            albums_only=args.albums_only,
         )
 
     if kind in {"google", "google_photos", "gphotos", "google_takeout"}:
@@ -61,7 +81,11 @@ def build_provider(spec: str, args: argparse.Namespace) -> PhotoProvider:
             or args.immich_url
             or os.environ.get("IMMICH_URL", "http://localhost:2283/api")
         )
-        api_key = args.immich_key or os.environ.get("IMMICH_API_KEY", "")
+        api_key = (
+            args.immich_key
+            or os.environ.get("IMMICH_API_KEY", "")
+            or _read_key_file(getattr(args, "immich_key_file", "immich.token"))
+        )
         return ImmichProvider(base_url=base_url, api_key=api_key)
 
     raise ValueError(
@@ -93,6 +117,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="How album folders link to canonical files in _library/YYYY/MM/ (default: hardlink).",
     )
     common.add_argument(
+        "--albums-only",
+        action="store_true",
+        help="For local sources, scan only the albums/ directory and ignore unlinked files in _library/.",
+    )
+    common.add_argument(
         "--google-secret",
         default="gphoto_oauth.json",
         help="Path to Google Photos OAuth client secret JSON file.",
@@ -120,6 +149,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Immich API base URL.",
     )
     common.add_argument("--immich-key", help="Immich API key.")
+    common.add_argument(
+        "--immich-key-file",
+        default="immich.token",
+        help="Path to a gitignored file containing the Immich API key (default: immich.token).",
+    )
 
     list_parser = subparsers.add_parser(
         "list", parents=[common], help="List photos on a provider."

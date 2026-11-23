@@ -67,6 +67,7 @@ class LocalProvider(PhotoProvider):
         album_delimiter: str = " ",
         link_mode: LinkMode = "hardlink",
         use_library_layout: bool = True,
+        albums_only: bool = False,
         on_progress: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.root_dir = Path(root_dir).expanduser().resolve()
@@ -76,6 +77,7 @@ class LocalProvider(PhotoProvider):
         self.album_delimiter = album_delimiter
         self.link_mode: LinkMode = link_mode
         self.use_library_layout = use_library_layout
+        self.albums_only = albums_only
         self.on_progress = on_progress
 
     def _log(self, message: str) -> None:
@@ -134,13 +136,25 @@ class LocalProvider(PhotoProvider):
     @staticmethod
     def compute_hashes(file_path: Path) -> tuple[str, str]:
         """Compute both (sha256_hex, sha512_base64) of a local file in a single pass."""
+        sha256_hex, sha512_b64, _ = LocalProvider.compute_all_hashes(file_path)
+        return sha256_hex, sha512_b64
+
+    @staticmethod
+    def compute_all_hashes(file_path: Path) -> tuple[str, str, str]:
+        """Compute (sha256_hex, sha512_base64, sha1_base64) of a local file in a single pass."""
         h256 = hashlib.sha256()
         h512 = hashlib.sha512()
+        h1 = hashlib.sha1()
         with file_path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(65536), b""):
                 h256.update(chunk)
                 h512.update(chunk)
-        return h256.hexdigest(), base64.b64encode(h512.digest()).decode("ascii")
+                h1.update(chunk)
+        return (
+            h256.hexdigest(),
+            base64.b64encode(h512.digest()).decode("ascii"),
+            base64.b64encode(h1.digest()).decode("ascii"),
+        )
 
     @staticmethod
     def extract_image_metadata(
@@ -281,34 +295,61 @@ class LocalProvider(PhotoProvider):
         Files linked across `_library/YYYY/MM/` and multiple `albums/...` folders
         (via hardlinks, symlinks, or identical SHA-256 checksums) are grouped into
         a single `PhotoItem` carrying all its `albums`.
+
+        When `self.albums_only` is True, scans only `albums/` (ignoring unlinked
+        files in `_library/`, hidden directories such as `.meta`, and `metadata/`).
         """
         if not self.root_dir.exists():
             return
 
-        iterator = self.root_dir.rglob("*") if self.recursive else self.root_dir.glob("*")
+        scan_root = self.albums_root if self.albums_only else self.root_dir
+        if not scan_root.exists():
+            return
 
-        inode_to_hashes: dict[tuple[int, int], tuple[str, str]] = {}
-        checksum_to_sha512: dict[str, str] = {}
+        def _iter_media_paths() -> Iterable[Path]:
+            if not self.recursive:
+                for p in sorted(scan_root.glob("*")):
+                    if (p.is_file() or p.is_symlink()) and p.suffix.lower() in SUPPORTED_EXTENSIONS:
+                        yield p
+                return
+
+            for walk_root, dirnames, filenames in os.walk(scan_root, topdown=True):
+                dirnames[:] = sorted(
+                    d for d in dirnames if not d.startswith(".") and d != "metadata"
+                )
+                rp = Path(walk_root)
+                for fname in sorted(filenames):
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext in SUPPORTED_EXTENSIONS:
+                        yield rp / fname
+
+        inode_to_hashes: dict[tuple[int, int], tuple[str, str, str]] = {}
+        checksum_to_extra_hashes: dict[str, tuple[str, str]] = {}
         grouped_paths: dict[str, list[Path]] = {}
+        scanned_files = 0
 
-        for path in sorted(iterator):
+        for path in _iter_media_paths():
             if not (path.is_file() or path.is_symlink()):
-                continue
-            if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
                 continue
             if not path.exists():
                 # Skip broken symlinks
                 continue
+
+            scanned_files += 1
+            if scanned_files % 1000 == 0:
+                self._log(
+                    f"[Local] Scanned {scanned_files} media file(s) ({len(grouped_paths)} unique)..."
+                )
 
             resolved = path.resolve()
             st = resolved.stat()
             inode_key = (st.st_dev, st.st_ino)
             hashes = inode_to_hashes.get(inode_key)
             if hashes is None:
-                hashes = self.compute_hashes(resolved)
+                hashes = self.compute_all_hashes(resolved)
                 inode_to_hashes[inode_key] = hashes
-            checksum, sha512_b64 = hashes
-            checksum_to_sha512[checksum] = sha512_b64
+            checksum, sha512_b64, sha1_b64 = hashes
+            checksum_to_extra_hashes[checksum] = (sha512_b64, sha1_b64)
 
             grouped_paths.setdefault(checksum, []).append(path)
 
@@ -329,11 +370,16 @@ class LocalProvider(PhotoProvider):
                 if target.is_relative_to(self.root_dir):
                     canonical_path = target
 
+            if self.albums_only and not albums:
+                continue
+
             if album and album not in albums:
                 continue
 
             item = self._build_photo_item(canonical_path, albums, checksum, all_paths=paths)
-            item.raw_metadata["sha512_b64"] = checksum_to_sha512[checksum]
+            sha512_b64, sha1_b64 = checksum_to_extra_hashes[checksum]
+            item.raw_metadata["sha512_b64"] = sha512_b64
+            item.raw_metadata["sha1_b64"] = sha1_b64
             yield item
 
     def _canonical_library_path(self, filename: str, created_at: Optional[datetime]) -> Path:

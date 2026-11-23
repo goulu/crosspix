@@ -46,12 +46,20 @@ class PhotoItem:
         """Return True if two PhotoItems represent the same underlying photo."""
         self_hashes = {
             h.lower()
-            for h in (self.checksum, self.raw_metadata.get("sha512_b64"))
+            for h in (
+                self.checksum,
+                self.raw_metadata.get("sha512_b64"),
+                self.raw_metadata.get("sha1_b64"),
+            )
             if isinstance(h, str) and h
         }
         other_hashes = {
             h.lower()
-            for h in (other.checksum, other.raw_metadata.get("sha512_b64"))
+            for h in (
+                other.checksum,
+                other.raw_metadata.get("sha512_b64"),
+                other.raw_metadata.get("sha1_b64"),
+            )
             if isinstance(h, str) and h
         }
         if self_hashes and other_hashes and (self_hashes & other_hashes):

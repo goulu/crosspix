@@ -86,14 +86,43 @@ class PhotoSynchronizer:
             f"{target.platform_name} ({len(target_items)} items)"
         )
 
+        # Build O(1) lookup indexes over target_items (hash + lowercase filename)
+        dst_by_hash: dict[str, PhotoItem] = {}
+        dst_by_name: dict[str, list[PhotoItem]] = {}
+
+        def _index_target(dst_item: PhotoItem) -> None:
+            for h in (
+                dst_item.checksum,
+                dst_item.raw_metadata.get("sha512_b64"),
+                dst_item.raw_metadata.get("sha1_b64"),
+            ):
+                if isinstance(h, str) and h:
+                    dst_by_hash.setdefault(h.lower(), dst_item)
+            dst_by_name.setdefault(dst_item.filename.lower(), []).append(dst_item)
+
+        for dst_item in target_items:
+            _index_target(dst_item)
+
+        def _find_match(src_item: PhotoItem) -> Optional[PhotoItem]:
+            for h in (
+                src_item.checksum,
+                src_item.raw_metadata.get("sha512_b64"),
+                src_item.raw_metadata.get("sha1_b64"),
+            ):
+                if isinstance(h, str) and h:
+                    hit = dst_by_hash.get(h.lower())
+                    if hit is not None:
+                        return hit
+            for cand in dst_by_name.get(src_item.filename.lower(), ()):
+                if src_item.matches(cand):
+                    return cand
+            return None
+
         with tempfile.TemporaryDirectory(prefix="crosspix_sync_") as tmp_dir:
             staging_dir = Path(tmp_dir)
             for idx, src_item in enumerate(source_items, start=1):
                 prefix = f"[{idx}/{total}]"
-                matched_dst = next(
-                    (dst_item for dst_item in target_items if src_item.matches(dst_item)),
-                    None,
-                )
+                matched_dst = _find_match(src_item)
                 if matched_dst is not None:
                     missing_albums = [
                         alb for alb in src_item.albums if alb and alb not in matched_dst.albums
@@ -157,6 +186,7 @@ class PhotoSynchronizer:
                     )
                     result.copied.append(uploaded_item)
                     target_items.append(uploaded_item)
+                    _index_target(uploaded_item)
                     self._log(
                         f"{prefix} Synced '{src_item.filename}' -> {target.platform_name}"
                     )

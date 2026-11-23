@@ -391,3 +391,389 @@ def test_in_place_ente_export_deduplication_and_hierarchy(tmp_path: Path) -> Non
     assert flat_alb1.stat().st_ino == ino
     assert flat_alb2.stat().st_ino == ino
 
+
+def test_migrate_ente_directory_moves_and_hardlinks(tmp_path: Path) -> None:
+    """Verify migrate_ente_directory moves files to _library/YYYY/MM/, creates album hardlinks, and removes duplicates."""
+    from scripts.migrate_ente_folder import migrate_ente_directory
+
+    ente_dir = tmp_path / "Ente"
+    # Photo 1 in two albums + Uncategorized (3 physical copies initially)
+    p1_uncat = ente_dir / "Uncategorized" / "cervin.jpg"
+    p1_alb1 = ente_dir / "Zermatt 2015" / "cervin.jpg"
+    p1_alb2 = ente_dir / "Montagne Suisse Eté" / "cervin.jpg"
+
+    _create_sample_jpeg(p1_uncat, "2015:08:12 10:30:00", (100, 150, 220))
+    p1_alb1.parent.mkdir(parents=True, exist_ok=True)
+    p1_alb1.write_bytes(p1_uncat.read_bytes())
+    p1_alb2.parent.mkdir(parents=True, exist_ok=True)
+    p1_alb2.write_bytes(p1_uncat.read_bytes())
+
+    # Sidecar metadata JSON inside Zermatt 2015/metadata/
+    meta_dir = p1_alb1.parent / "metadata"
+    meta_dir.mkdir()
+    (meta_dir / "cervin.jpg.json").write_text('{"title": "cervin.jpg"}', encoding="utf-8")
+
+    stats = migrate_ente_directory(source_dir=ente_dir, link_mode="hardlink")
+    assert stats["scanned"] == 3
+    assert stats["moved_to_library"] == 1
+    assert stats["deduplicated_copies"] == 2
+    assert stats["album_links_created"] == 2
+
+    canonical = ente_dir / "_library" / "2015" / "08" / "cervin.jpg"
+    link1 = ente_dir / "albums" / "Zermatt" / "2015" / "cervin.jpg"
+    link2 = ente_dir / "albums" / "Montagne" / "Suisse" / "Eté" / "cervin.jpg"
+
+    assert canonical.exists()
+    assert link1.exists()
+    assert link2.exists()
+    assert canonical.stat().st_ino == link1.stat().st_ino == link2.stat().st_ino
+
+    # Legacy flat folders should have been moved and cleaned up
+    assert not p1_uncat.exists()
+    assert not p1_alb1.exists()
+    assert not p1_alb2.exists()
+    assert not (ente_dir / "albums" / "Uncategorized").exists()
+
+
+def test_migrate_ente_directory_handles_same_name_collisions_and_resume(tmp_path: Path) -> None:
+    """Sequential migration disambiguates distinct files sharing a filename in YYYY/MM and deduplicates their copies."""
+    from scripts.migrate_ente_folder import migrate_ente_directory
+
+    ente_dir = tmp_path / "Ente"
+
+    # Two distinct photos with the exact same filename and month
+    img1_a = ente_dir / "Album A" / "IMG_0001.jpg"
+    img2_b = ente_dir / "Album B" / "IMG_0001.jpg"
+    img2_c = ente_dir / "Album C" / "IMG_0001.jpg"
+
+    _create_sample_jpeg(img1_a, "2020:07:14 12:00:00", (200, 10, 10))
+    _create_sample_jpeg(img2_b, "2020:07:14 18:00:00", (10, 10, 200))
+    img2_c.parent.mkdir(parents=True, exist_ok=True)
+    img2_c.write_bytes(img2_b.read_bytes())
+
+    # Dry-run should preview moves + deduplication without touching disk
+    dry_stats = migrate_ente_directory(source_dir=ente_dir, dry_run=True)
+    assert dry_stats["scanned"] == 3
+    assert dry_stats["moved_to_library"] == 2
+    assert dry_stats["deduplicated_copies"] == 1
+    assert dry_stats["album_links_created"] == 3
+    assert not (ente_dir / "_library").exists()
+
+    # Real run
+    stats = migrate_ente_directory(source_dir=ente_dir, link_mode="hardlink")
+    assert stats["scanned"] == 3
+    assert stats["moved_to_library"] == 2
+    assert stats["deduplicated_copies"] == 1
+    assert stats["album_links_created"] == 3
+
+    lib_files = sorted((ente_dir / "_library" / "2020" / "07").iterdir())
+    assert len(lib_files) == 2
+
+    link_a = next((ente_dir / "albums" / "Album" / "A").iterdir())
+    link_b = next((ente_dir / "albums" / "Album" / "B").iterdir())
+    link_c = next((ente_dir / "albums" / "Album" / "C").iterdir())
+    assert link_b.stat().st_ino == link_c.stat().st_ino
+    assert link_a.stat().st_ino != link_b.stat().st_ino
+
+    # Adding another copy later and re-running deduplicates directly against `_library/YYYY/MM/`
+    img1_d = ente_dir / "Album D" / "IMG_0001.jpg"
+    img1_d.parent.mkdir(parents=True, exist_ok=True)
+    img1_d.write_bytes(link_a.read_bytes())
+
+    resume_stats = migrate_ente_directory(source_dir=ente_dir, link_mode="hardlink")
+    assert resume_stats["scanned"] == 1
+    assert resume_stats["moved_to_library"] == 0
+    assert resume_stats["deduplicated_copies"] == 1
+    assert resume_stats["album_links_created"] == 1
+    link_d = next((ente_dir / "albums" / "Album" / "D").iterdir())
+    assert link_d.stat().st_ino == link_a.stat().st_ino
+
+
+def test_migrate_ente_directory_moves_remaining_files_and_meta_dirs(tmp_path: Path) -> None:
+    """Verify remaining non-media files and hidden folders like `.meta` move into the corresponding album."""
+    from scripts.migrate_ente_folder import migrate_ente_directory
+
+    ente_dir = tmp_path / "Ente"
+    album_src = ente_dir / "2026 Grand Bisse d'Ayent"
+
+    # A photo + a leftover non-media file + a `.meta` folder with nested files
+    photo = album_src / "bisse.jpg"
+    _create_sample_jpeg(photo, "2026:06:15 09:30:00", (40, 120, 80))
+
+    gpx = album_src / "parcours.gpx"
+    gpx.write_text("<gpx>track</gpx>", encoding="utf-8")
+
+    meta_dir = album_src / ".meta"
+    (meta_dir / "nested").mkdir(parents=True)
+    (meta_dir / "album.json").write_text('{"desc": "bisse"}', encoding="utf-8")
+    (meta_dir / "nested" / "thumb.jpg").write_bytes(b"fake-thumb")
+
+    # Dry-run should not touch disk
+    dry_stats = migrate_ente_directory(source_dir=ente_dir, dry_run=True)
+    assert dry_stats["extra_files_moved"] >= 3
+    assert meta_dir.exists()
+    assert gpx.exists()
+
+    # Real run
+    stats = migrate_ente_directory(source_dir=ente_dir, link_mode="hardlink")
+    assert stats["moved_to_library"] == 1
+    assert stats["album_links_created"] == 1
+    assert stats["extra_files_moved"] == 3  # parcours.gpx + 2 files inside .meta
+
+    target_album = ente_dir / "albums" / "2026" / "Grand" / "Bisse" / "d'Ayent"
+    assert (target_album / "bisse.jpg").exists()
+    assert (target_album / "parcours.gpx").read_text(encoding="utf-8") == "<gpx>track</gpx>"
+    assert (target_album / ".meta" / "album.json").read_text(encoding="utf-8") == '{"desc": "bisse"}'
+    assert (target_album / ".meta" / "nested" / "thumb.jpg").read_bytes() == b"fake-thumb"
+    # Thumbnail inside `.meta` must NOT have been imported into `_library/`
+    assert list((ente_dir / "_library" / "2026" / "06").iterdir()) == [
+        ente_dir / "_library" / "2026" / "06" / "bisse.jpg"
+    ]
+    # Original album directory should be completely gone
+    assert not album_src.exists()
+
+    # Re-running when only `.meta` remains in the legacy folder merges cleanly into existing `.meta`
+    (album_src / ".meta").mkdir(parents=True)
+    (album_src / ".meta" / "album.json").write_text('{"desc": "bisse"}', encoding="utf-8")
+    (album_src / ".meta" / "extra.txt").write_text("more", encoding="utf-8")
+
+    merge_stats = migrate_ente_directory(source_dir=ente_dir, link_mode="hardlink")
+    assert merge_stats["deduplicated_copies"] == 1
+    assert merge_stats["extra_files_moved"] == 1
+    assert (target_album / ".meta" / "extra.txt").read_text(encoding="utf-8") == "more"
+    assert not (target_album / ".meta" / ".meta").exists()
+    assert not album_src.exists()
+
+
+def test_deduplicate_library_variants_priority_and_album_links(tmp_path: Path) -> None:
+    """Verify `_o` > `-modifié` > plain deduplication, short renaming, album hardlink rebuilding, and multi-_o safety."""
+    import os
+    from scripts.deduplicate_library_variants import deduplicate_library_variants
+
+    root = tmp_path / "Ente"
+    lib_dir = root / "_library" / "2014" / "07"
+    alb_vac = root / "albums" / "Vacances" / "2014"
+    alb_fam = root / "albums" / "Famille"
+    lib_dir.mkdir(parents=True)
+    alb_vac.mkdir(parents=True)
+    alb_fam.mkdir(parents=True)
+
+    # Group 1: plain + `-modifié` + `_<id>_o` -> must keep `_o`, rename to short, rebuild ALL album links
+    g1_plain = lib_dir / "20140726_104622.jpg"
+    g1_mod = lib_dir / "20140726_104622-modifié.jpg"
+    g1_o = lib_dir / "20140726_104622_14735170026_o.jpg"
+    _create_sample_jpeg(g1_plain, "2014:07:26 10:46:22", (100, 100, 100))
+    _create_sample_jpeg(g1_mod, "2014:07:26 10:46:22", (110, 110, 110))
+    _create_sample_jpeg(g1_o, "2014:07:26 10:46:22", (120, 120, 120))
+    g1_o_bytes = g1_o.read_bytes()
+    g1_o_ino = g1_o.stat().st_ino
+
+    # Album Vacances linked to `_o` AND plain; Album Famille linked to `-modifié`
+    os.link(g1_o, alb_vac / g1_o.name)
+    os.link(g1_plain, alb_vac / g1_plain.name)
+    os.link(g1_mod, alb_fam / g1_mod.name)
+
+    # Group 2: plain + `-modifié` (no `_o`) -> must keep `-modifié`, rename to short, rebuild album link
+    g2_plain = lib_dir / "20140727_120000.jpg"
+    g2_mod = lib_dir / "20140727_120000-modifié.jpg"
+    _create_sample_jpeg(g2_plain, "2014:07:27 12:00:00", (50, 50, 200))
+    _create_sample_jpeg(g2_mod, "2014:07:27 12:00:00", (50, 200, 50))
+    g2_mod_bytes = g2_mod.read_bytes()
+    g2_mod_ino = g2_mod.stat().st_ino
+    os.link(g2_plain, alb_fam / g2_plain.name)
+
+    # Group 3: two visually DISTINCT `_o` photos sharing the same Flickr title -> must BOTH be preserved!
+    from PIL import Image, ImageDraw
+
+    def _make_patterned(path: Path, vertical: bool) -> None:
+        img = Image.new("RGB", (128, 128), (20, 20, 20))
+        draw = ImageDraw.Draw(img)
+        if vertical:
+            draw.rectangle([0, 0, 64, 128], fill=(240, 240, 240))
+        else:
+            draw.rectangle([0, 0, 128, 64], fill=(240, 240, 240))
+        img.save(path, format="JPEG")
+
+    g3_a = lib_dir / "Happy beach_19933191269_o.jpg"
+    g3_b = lib_dir / "Happy beach_19933311749_o.jpg"
+    _make_patterned(g3_a, vertical=True)
+    _make_patterned(g3_b, vertical=False)
+
+    # Dry-run leaves disk untouched
+    dry = deduplicate_library_variants(root_dir=root, dry_run=True)
+    assert dry["groups_processed"] == 2
+    assert dry["files_deleted"] == 3
+    assert g1_o.exists() and g1_mod.exists() and g2_mod.exists()
+
+    # Real run
+    stats = deduplicate_library_variants(root_dir=root, dry_run=False)
+    assert stats["groups_processed"] == 2
+    assert stats["files_deleted"] == 3
+    assert stats["files_renamed"] == 2
+    assert stats["distinct_preserved"] == 2
+
+    # Group 1 checks
+    g1_final = lib_dir / "20140726_104622.jpg"
+    assert g1_final.exists()
+    assert not g1_mod.exists()
+    assert not g1_o.exists()
+    assert g1_final.read_bytes() == g1_o_bytes
+    assert g1_final.stat().st_ino == g1_o_ino
+
+    # Album links for Group 1: both albums now have ONLY the short name hardlinked to g1_o_ino!
+    assert (alb_vac / "20140726_104622.jpg").stat().st_ino == g1_o_ino
+    assert not (alb_vac / g1_o.name).exists()
+    assert (alb_fam / "20140726_104622.jpg").stat().st_ino == g1_o_ino
+    assert not (alb_fam / g1_mod.name).exists()
+
+    # Group 2 checks
+    g2_final = lib_dir / "20140727_120000.jpg"
+    assert g2_final.exists()
+    assert not g2_mod.exists()
+    assert g2_final.read_bytes() == g2_mod_bytes
+    assert g2_final.stat().st_ino == g2_mod_ino
+    assert (alb_fam / "20140727_120000.jpg").stat().st_ino == g2_mod_ino
+
+    # Group 3 checks: both distinct `_o` photos untouched!
+    assert g3_a.exists()
+    assert g3_b.exists()
+
+    # Phase 2 standalone repair test (--albums-only): broken symlink + orphaned nlink==1 hardlink
+    broken_sym = alb_vac / "20140726_104622_14735170026_o.jpg"
+    os.symlink(os.path.relpath(lib_dir / "20140726_104622_14735170026_o.jpg", alb_vac), broken_sym)
+    # Remove the valid link in alb_vac first so the broken symlink is restored as the album link
+    (alb_vac / "20140726_104622.jpg").unlink()
+
+    alb_orphan = root / "albums" / "Orphans"
+    alb_orphan.mkdir(parents=True)
+    orphan_copy = alb_orphan / "20140727_120000-modifié.jpg"
+    orphan_copy.write_bytes(b"stale-orphan-copy")
+
+    repair_stats = deduplicate_library_variants(root_dir=root, albums_only=True)
+    assert repair_stats["broken_links_repaired"] == 2
+    assert (alb_vac / "20140726_104622.jpg").is_symlink()
+    assert (alb_vac / "20140726_104622.jpg").resolve() == g1_final.resolve()
+    assert not broken_sym.exists()
+    assert (alb_orphan / "20140727_120000.jpg").stat().st_ino == g2_mod_ino
+    assert not orphan_copy.exists()
+
+
+def test_deduplicate_library_variants_hex8_and_paren_copies(tmp_path: Path) -> None:
+    """Verify `_<8hex>` and `(N)` duplicates keep the higher-quality copy when visually identical, and preserve distinct photos."""
+    import os
+    from PIL import Image, ImageDraw
+    from scripts.deduplicate_library_variants import deduplicate_library_variants
+
+    root = tmp_path / "Ente"
+    lib_dir = root / "_library" / "2016" / "02"
+    alb_dir = root / "albums" / "Ski" / "2016"
+    lib_dir.mkdir(parents=True)
+    alb_dir.mkdir(parents=True)
+
+    def _save_pattern(path: Path, vertical: bool, size: tuple[int, int], quality: int) -> None:
+        img = Image.new("RGB", size, (30, 40, 50))
+        draw = ImageDraw.Draw(img)
+        w, h = size
+        if vertical:
+            draw.rectangle([0, 0, w // 2, h], fill=(220, 180, 60))
+            draw.ellipse([w // 4, h // 4, 3 * w // 4, 3 * h // 4], fill=(40, 160, 200))
+        else:
+            draw.rectangle([0, 0, w, h // 2], fill=(200, 60, 120))
+            draw.rectangle([w // 4, h // 3, 3 * w // 4, 2 * h // 3], fill=(80, 220, 100))
+        img.save(path, format="JPEG", quality=quality)
+
+    # 1. `_<8hex>` visual duplicate: `_403659de` is higher quality -> keep it, rename to short, update album link
+    wa12_small = lib_dir / "IMG-20160221-WA0012.jpeg"
+    wa12_large = lib_dir / "IMG-20160221-WA0012_403659de.jpeg"
+    _save_pattern(wa12_small, vertical=True, size=(200, 300), quality=40)
+    _save_pattern(wa12_large, vertical=True, size=(200, 300), quality=95)
+    wa12_large_ino = wa12_large.stat().st_ino
+    os.link(wa12_small, alb_dir / wa12_small.name)
+
+    # 2. `(1)` visual duplicate: `(1)` is higher quality -> keep it, rename to short, update album link
+    wa19_small = lib_dir / "IMG-20160221-WA0019.jpeg"
+    wa19_large = lib_dir / "IMG-20160221-WA0019(1).jpeg"
+    _save_pattern(wa19_small, vertical=False, size=(300, 200), quality=40)
+    _save_pattern(wa19_large, vertical=False, size=(300, 200), quality=95)
+    wa19_large_ino = wa19_large.stat().st_ino
+    os.link(wa19_large, alb_dir / wa19_large.name)
+
+    # 3. Visually DISTINCT photo with `_<8hex>` -> MUST be preserved!
+    diff_a = lib_dir / "001.jpg"
+    diff_b = lib_dir / "001_deadbeef.jpg"
+    _save_pattern(diff_a, vertical=True, size=(200, 200), quality=90)
+    _save_pattern(diff_b, vertical=False, size=(200, 200), quality=90)
+
+    # 4. Date-named files `IMG_20160221.jpg` and `IMG_20160222.jpg` -> MUST NOT be treated as `_<8hex>`!
+    date_a = lib_dir / "IMG_20160221.jpg"
+    date_b = lib_dir / "IMG_20160222.jpg"
+    _save_pattern(date_a, vertical=True, size=(200, 200), quality=90)
+    _save_pattern(date_b, vertical=True, size=(200, 200), quality=90)
+
+    stats = deduplicate_library_variants(root_dir=root)
+    assert stats["groups_processed"] == 2
+    assert stats["files_deleted"] == 2
+    assert stats["files_renamed"] == 2
+    assert stats["distinct_preserved"] == 1
+
+    # WA0012: kept high-quality `_403659de`, renamed to short, album link updated to same inode
+    assert (lib_dir / "IMG-20160221-WA0012.jpeg").stat().st_ino == wa12_large_ino
+    assert not wa12_large.exists()
+    assert (alb_dir / "IMG-20160221-WA0012.jpeg").stat().st_ino == wa12_large_ino
+
+    # WA0019: kept high-quality `(1)`, renamed to short, album link renamed to short
+    assert (lib_dir / "IMG-20160221-WA0019.jpeg").stat().st_ino == wa19_large_ino
+    assert not wa19_large.exists()
+    assert (alb_dir / "IMG-20160221-WA0019.jpeg").stat().st_ino == wa19_large_ino
+    assert not (alb_dir / "IMG-20160221-WA0019(1).jpeg").exists()
+
+    # Distinct `001` pair & date-named pair completely preserved
+    assert diff_a.exists() and diff_b.exists()
+    assert date_a.exists() and date_b.exists()
+
+
+def test_local_albums_only_and_immich_url_normalization(tmp_path: Path) -> None:
+    """Verify LocalProvider(albums_only=True) skips `_library/`-only photos and `.meta/` while keeping multi-album links."""
+    import os
+
+    root = tmp_path / "Ente"
+    lib_only = root / "_library" / "2024" / "05" / "unlinked.jpg"
+    lib_linked = root / "_library" / "2024" / "05" / "shared.jpg"
+    _create_sample_jpeg(lib_only, "2024:05:01 10:00:00", (10, 20, 30))
+    _create_sample_jpeg(lib_linked, "2024:05:02 11:00:00", (40, 50, 60))
+
+    alb1 = root / "albums" / "Voyage" / "Bali"
+    alb2 = root / "albums" / "Famille"
+    meta = alb1 / ".meta"
+    alb1.mkdir(parents=True)
+    alb2.mkdir(parents=True)
+    meta.mkdir(parents=True)
+    os.link(lib_linked, alb1 / "shared.jpg")
+    os.link(lib_linked, alb2 / "shared.jpg")
+    _create_sample_jpeg(meta / "thumb.jpg", "2024:05:02 11:00:00", (70, 80, 90))
+
+    local = LocalProvider(root_dir=root, albums_only=True)
+    items = list(local.list_photos())
+    assert len(items) == 1
+    assert items[0].filename == "shared.jpg"
+    assert items[0].albums == ["Famille", "Voyage Bali"]
+    assert "sha1_b64" in items[0].raw_metadata
+
+    # ImmichProvider normalizes URLs without `/api` and matches local items by Immich SHA-1 Base64 checksum
+    immich = ImmichProvider(base_url="http://localhost:2283", api_key="k")
+    assert immich.base_url == "http://localhost:2283/api"
+    remote_item = PhotoItem(
+        id="uuid-1",
+        filename="renamed_on_immich.jpg",
+        platform="immich",
+        checksum=items[0].raw_metadata["sha1_b64"],
+    )
+    assert items[0].matches(remote_item)
+
+
+
+
+
+
+
+

@@ -27,9 +27,12 @@ class ImmichProvider(PhotoProvider):
         http_client: Optional[httpx.Client] = None,
         include_albums: bool = True,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
+        normalized = base_url.rstrip("/")
+        if not normalized.endswith("/api"):
+            normalized = f"{normalized}/api"
+        self.base_url = normalized
         self.api_key = api_key
-        self.http_client = http_client or httpx.Client(timeout=60.0)
+        self.http_client = http_client or httpx.Client(timeout=300.0)
         self.include_albums = include_albums
         self._album_cache: dict[str, str] = {}
 
@@ -183,15 +186,26 @@ class ImmichProvider(PhotoProvider):
 
             items_by_id: dict[str, PhotoItem] = {}
 
-            query = MetadataSearchDto(size=250)
-            results = await client.search.search_assets(body=query)
-            assets_obj = getattr(results, "assets", results)
-            items = getattr(assets_obj, "items", assets_obj)
-            if isinstance(items, list):
-                for a in items:
-                    photo_item = self._asset_to_photo_item(a)
-                    if photo_item.id:
-                        items_by_id[photo_item.id] = photo_item
+            page = 1
+            while True:
+                query = MetadataSearchDto(size=1000, page=page)
+                results = await client.search.search_assets(body=query)
+                assets_obj = getattr(results, "assets", results)
+                items = getattr(assets_obj, "items", assets_obj)
+                if isinstance(items, list):
+                    for a in items:
+                        photo_item = self._asset_to_photo_item(a)
+                        if photo_item.id:
+                            items_by_id[photo_item.id] = photo_item
+                next_page = getattr(assets_obj, "next_page", None) or getattr(
+                    assets_obj, "nextPage", None
+                )
+                if not next_page:
+                    break
+                try:
+                    page = int(next_page)
+                except (TypeError, ValueError):
+                    break
 
             if self.include_albums:
                 albums = await client.album.get_all_albums()
@@ -279,6 +293,11 @@ class ImmichProvider(PhotoProvider):
             "fileModifiedAt": datetime.fromtimestamp(stat.st_mtime).isoformat() + "Z",
             "isFavorite": "false",
         }
+        upload_headers = self._headers()
+        sha1_b64 = item.raw_metadata.get("sha1_b64") if item else None
+        if isinstance(sha1_b64, str) and sha1_b64:
+            upload_headers["x-immich-checksum"] = sha1_b64
+
         with file_path.open("rb") as handle:
             files = {
                 "assetData": (
@@ -289,7 +308,7 @@ class ImmichProvider(PhotoProvider):
             }
             response = self.http_client.post(
                 f"{self.base_url}/assets",
-                headers=self._headers(),
+                headers=upload_headers,
                 data=data,
                 files=files,
             )
