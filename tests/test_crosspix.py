@@ -771,6 +771,485 @@ def test_local_albums_only_and_immich_url_normalization(tmp_path: Path) -> None:
     assert items[0].matches(remote_item)
 
 
+def test_streaming_local_to_immich_sync_and_resume(tmp_path: Path) -> None:
+    """Verify streaming local->Immich sync uploads progressively, skips _library-only files, and resumes cleanly."""
+    import os
+
+    root = tmp_path / "Ente"
+    lib_only = root / "_library" / "2024" / "05" / "unlinked.jpg"
+    lib_shared = root / "_library" / "2024" / "05" / "shared.jpg"
+    lib_solo = root / "_library" / "2024" / "05" / "solo.jpg"
+    _create_sample_jpeg(lib_only, "2024:05:01 10:00:00", (10, 10, 10))
+    _create_sample_jpeg(lib_shared, "2024:05:02 11:00:00", (40, 80, 120))
+    _create_sample_jpeg(lib_solo, "2024:05:03 12:00:00", (200, 100, 50))
+
+    alb1 = root / "albums" / "AlbumA"
+    alb2 = root / "albums" / "AlbumB"
+    alb1.mkdir(parents=True)
+    alb2.mkdir(parents=True)
+    os.link(lib_shared, alb1 / "shared.jpg")
+    os.link(lib_solo, alb1 / "solo.jpg")
+    os.link(lib_shared, alb2 / "shared.jpg")
+
+    # Stateful fake Immich HTTP server supporting /albums, /assets/bulk-upload-check, /assets, /albums/{id}/assets
+    uploaded_by_sha1: dict[str, str] = {}
+    albums_by_name: dict[str, str] = {}
+    album_assets: dict[str, set[str]] = {}
+    next_asset_num = 1
+    next_album_num = 1
+
+    def fake_get(url: str, headers=None, params=None):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        if url.endswith("/albums"):
+            resp.json.return_value = [
+                {"id": aid, "albumName": name} for name, aid in albums_by_name.items()
+            ]
+        elif "/albums/" in url:
+            aid = url.rsplit("/albums/", 1)[1]
+            resp.json.return_value = {
+                "id": aid,
+                "assets": [{"id": x} for x in sorted(album_assets.get(aid, set()))],
+            }
+        return resp
+
+    def fake_post(url: str, headers=None, json=None, data=None, files=None):
+        nonlocal next_asset_num, next_album_num
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        if url.endswith("/assets/bulk-upload-check"):
+            results = []
+            for entry in json["assets"]:
+                ck = entry["checksum"]
+                if ck in uploaded_by_sha1:
+                    results.append(
+                        {"id": entry["id"], "action": "reject", "reason": "duplicate", "assetId": uploaded_by_sha1[ck]}
+                    )
+                else:
+                    results.append({"id": entry["id"], "action": "accept"})
+            resp.json.return_value = {"results": results}
+        elif url.endswith("/assets"):
+            ck = (headers or {}).get("x-immich-checksum", f"ck-{next_asset_num}")
+            aid = f"asset-{next_asset_num}"
+            next_asset_num += 1
+            uploaded_by_sha1[ck] = aid
+            resp.json.return_value = {"id": aid, "status": "created"}
+        elif url.endswith("/albums"):
+            name = json["albumName"]
+            alb_id = f"alb-{next_album_num}"
+            next_album_num += 1
+            albums_by_name[name] = alb_id
+            album_assets[alb_id] = set()
+            resp.json.return_value = {"id": alb_id, "albumName": name}
+        return resp
+
+    def fake_put(url: str, headers=None, json=None):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        alb_id = url.split("/albums/")[1].split("/assets")[0]
+        album_assets.setdefault(alb_id, set()).update(json["ids"])
+        return resp
+
+    mock_http = MagicMock()
+    mock_http.get.side_effect = fake_get
+    mock_http.post.side_effect = fake_post
+    mock_http.put.side_effect = fake_put
+
+    source = LocalProvider(root_dir=root, albums_only=True)
+    target = ImmichProvider(base_url="http://localhost:2283", api_key="test-key", http_client=mock_http)
+    syncer = PhotoSynchronizer(dry_run=False, on_progress=lambda _: None)
+
+    # Run 1: uploads `shared.jpg` and `solo.jpg` once, links `shared.jpg` into AlbumB without re-uploading
+    res1 = syncer.sync(source, target)
+    assert len(res1.copied) == 2
+    assert len(res1.albums_updated) == 1
+    assert len(res1.errors) == 0
+    assert set(albums_by_name.keys()) == {"AlbumA", "AlbumB"}
+    assert len(album_assets[albums_by_name["AlbumA"]]) == 2
+    assert len(album_assets[albums_by_name["AlbumB"]]) == 1
+
+    # Run 2 (resume after completion with fresh provider instances): skips everything with 0 uploads!
+    target2 = ImmichProvider(base_url="http://localhost:2283", api_key="test-key", http_client=mock_http)
+    res2 = syncer.sync(source, target2)
+    assert len(res2.copied) == 0
+    assert len(res2.albums_updated) == 0
+    assert len(res2.skipped) == 3
+    assert len(res2.errors) == 0
+
+    # Run 3 (simulate interruption before AlbumB was linked): links AlbumB without re-uploading!
+    album_assets[albums_by_name["AlbumB"]].clear()
+    target3 = ImmichProvider(base_url="http://localhost:2283", api_key="test-key", http_client=mock_http)
+    res3 = syncer.sync(source, target3)
+    assert len(res3.copied) == 0
+    assert len(res3.albums_updated) == 1
+    assert len(res3.skipped) == 2
+    assert len(album_assets[albums_by_name["AlbumB"]]) == 1
+
+
+def _make_fake_youtube_service():
+    """Create a stateful mock YouTube Data API v3 service for unit tests."""
+    videos_store: list[dict] = []
+    playlists_store: dict[str, dict] = {}
+    playlist_items_store: dict[str, list[str]] = {}
+    next_vid = 1
+    next_pl = 1
+
+    class _Exec:
+        def __init__(self, result):
+            self._result = result
+
+        def execute(self):
+            return self._result
+
+    class _ResumableInsert:
+        def __init__(self, body):
+            self._body = body
+            self._done = False
+
+        def next_chunk(self):
+            nonlocal next_vid
+            vid = f"yt-vid-{next_vid}"
+            next_vid += 1
+            videos_store.append(
+                {
+                    "id": vid,
+                    "snippet": {
+                        "title": self._body["snippet"]["title"],
+                        "description": self._body["snippet"]["description"],
+                        "publishedAt": "2026-01-01T12:00:00Z",
+                        "resourceId": {"videoId": vid},
+                    },
+                    "contentDetails": {"videoId": vid, "videoPublishedAt": "2026-01-01T12:00:00Z"},
+                }
+            )
+            return None, {"id": vid, "snippet": self._body["snippet"]}
+
+    service = MagicMock()
+
+    def channels_list(**kwargs):
+        return _Exec({"items": [{"contentDetails": {"relatedPlaylists": {"uploads": "UU-uploads"}}}]})
+
+    def playlists_list(**kwargs):
+        return _Exec({"items": list(playlists_store.values())})
+
+    def playlists_insert(part, body):
+        nonlocal next_pl
+        pl_id = f"PL-{next_pl}"
+        next_pl += 1
+        playlists_store[pl_id] = {"id": pl_id, "snippet": body["snippet"]}
+        playlist_items_store[pl_id] = []
+        return _Exec({"id": pl_id, "snippet": body["snippet"]})
+
+    def playlist_items_list(part, playlistId, maxResults=50, pageToken=None):
+        if playlistId == "UU-uploads":
+            return _Exec({"items": list(videos_store)})
+        items = [
+            {"contentDetails": {"videoId": vid}} for vid in playlist_items_store.get(playlistId, [])
+        ]
+        return _Exec({"items": items})
+
+    def playlist_items_insert(part, body):
+        pl_id = body["snippet"]["playlistId"]
+        vid = body["snippet"]["resourceId"]["videoId"]
+        playlist_items_store.setdefault(pl_id, []).append(vid)
+        return _Exec({"id": f"pli-{pl_id}-{vid}"})
+
+    def videos_insert(part, body, media_body):
+        return _ResumableInsert(body)
+
+    service.channels.return_value.list.side_effect = channels_list
+    service.playlists.return_value.list.side_effect = playlists_list
+    service.playlists.return_value.insert.side_effect = playlists_insert
+    service.playlistItems.return_value.list.side_effect = playlist_items_list
+    service.playlistItems.return_value.insert.side_effect = playlist_items_insert
+    service.videos.return_value.insert.side_effect = videos_insert
+
+    return service, videos_store, playlists_store, playlist_items_store
+
+
+def test_max_video_size_skip_and_youtube_routing(tmp_path: Path) -> None:
+    """Verify max_video_size_mb skips large videos on Immich and can route them to YouTube playlists."""
+    import os
+    from crosspix.youtube import YouTubeProvider
+
+    root = tmp_path / "Ente"
+    alb = root / "albums" / "Vacances" / "2025"
+    alb.mkdir(parents=True)
+
+    photo = _create_sample_jpeg(alb / "pic.jpg", "2025:07:10 10:00:00", (100, 120, 140))
+    small_vid = alb / "small.mp4"
+    small_vid.write_bytes(b"\x00" * 50_000)  # ~0.05 MB
+    big_vid = alb / "big.mp4"
+    big_vid.write_bytes(b"\x01" * (2 * 1024 * 1024))  # 2.0 MB
+
+    # Mock Immich HTTP client accepting everything
+    immich_uploads: list[str] = []
+    mock_http = MagicMock()
+    def fake_get(url, headers=None, params=None):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = [] if url.endswith("/albums") else {"assets": []}
+        return resp
+    def fake_post(url, headers=None, json=None, data=None, files=None):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        if url.endswith("/assets/bulk-upload-check"):
+            resp.json.return_value = {"results": [{"id": e["id"], "action": "accept"} for e in json["assets"]]}
+        elif url.endswith("/assets"):
+            immich_uploads.append(files["assetData"][0])
+            resp.json.return_value = {"id": f"im-{len(immich_uploads)}", "status": "created"}
+        elif url.endswith("/albums"):
+            resp.json.return_value = {"id": "alb-1", "albumName": json["albumName"]}
+        return resp
+    def fake_put(url, headers=None, json=None):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        return resp
+    mock_http.get.side_effect = fake_get
+    mock_http.post.side_effect = fake_post
+    mock_http.put.side_effect = fake_put
+
+    source = LocalProvider(root_dir=root, albums_only=True)
+    immich = ImmichProvider(base_url="http://localhost:2283", api_key="k", http_client=mock_http)
+
+    # 1. Skip large videos (> 1 MB) without YouTube routing
+    sync_skip = PhotoSynchronizer(max_video_size_mb=1.0, on_progress=lambda _: None)
+    res_skip = sync_skip.sync(source, immich)
+    assert sorted(immich_uploads) == ["pic.jpg", "small.mp4"]
+    assert len(res_skip.skipped_large_videos) == 1
+    assert res_skip.skipped_large_videos[0].filename == "big.mp4"
+
+    # 2. Route large videos (> 1 MB) to YouTube automatically during Immich sync
+    immich_uploads.clear()
+    yt_service, yt_videos, yt_playlists, yt_pl_items = _make_fake_youtube_service()
+    yt = YouTubeProvider(service=yt_service, privacy_status="private", on_progress=lambda _: None)
+    immich2 = ImmichProvider(base_url="http://localhost:2283", api_key="k", http_client=mock_http)
+
+    sync_route = PhotoSynchronizer(
+        max_video_size_mb=1.0,
+        large_video_target=yt,
+        on_progress=lambda _: None,
+    )
+    res_route = sync_route.sync(source, immich2)
+    assert sorted(immich_uploads) == ["pic.jpg", "small.mp4"]
+    assert len(res_route.routed_to_youtube) == 1
+    assert len(yt_videos) == 1
+    assert "crosspix_sha1:" in yt_videos[0]["snippet"]["description"]
+    assert any(pl["snippet"]["title"] == "Vacances 2025" for pl in yt_playlists.values())
+    pl_id = next(iter(yt_playlists.keys()))
+    assert yt_pl_items[pl_id] == [yt_videos[0]["id"]]
+
+    # 3. Direct streaming sync local -> YouTube with min_video_size_mb=1.0 resumes cleanly without re-uploading!
+    alb2 = root / "albums" / "BestOf"
+    alb2.mkdir(parents=True)
+    os.link(big_vid, alb2 / "big.mp4")
+
+    yt2 = YouTubeProvider(service=yt_service, privacy_status="private", on_progress=lambda _: None)
+    sync_yt = PhotoSynchronizer(min_video_size_mb=1.0, on_progress=lambda _: None)
+    res_yt = sync_yt.sync(source, yt2)
+    # `big.mp4` already uploaded in step 2 -> 0 new uploads, skipped in Vacances 2025, linked in BestOf!
+    assert len(res_yt.copied) == 0
+    assert len(res_yt.skipped) == 1
+    assert len(res_yt.albums_updated) == 1
+    assert len(yt_videos) == 1
+    assert {pl["snippet"]["title"] for pl in yt_playlists.values()} == {"Vacances 2025", "BestOf"}
+
+
+def test_no_albums_images_only_and_no_recursive_options(tmp_path: Path) -> None:
+    """Verify --no-albums, --images-only, and --no-recursive options across streaming and generic sync."""
+    src_root = tmp_path / "src"
+    sub_dir = src_root / "Vacances 2025"
+    sub_dir.mkdir(parents=True)
+
+    root_img = _create_sample_jpeg(src_root / "root.jpg", "2025:05:01 10:00:00", (10, 20, 30))
+    sub_img = _create_sample_jpeg(sub_dir / "sub.jpg", "2025:05:02 11:00:00", (40, 50, 60))
+    sub_vid = sub_dir / "clip.mp4"
+    sub_vid.write_bytes(b"\x00" * 1024)
+
+    # 1. Streaming local -> Immich with sync_albums=False and images_only=True
+    immich_uploads: list[str] = []
+    albums_api_calls: list[str] = []
+    mock_http = MagicMock()
+
+    def fake_get(url, headers=None, params=None):
+        if "/albums" in url:
+            albums_api_calls.append(f"GET {url}")
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = []
+        return resp
+
+    def fake_post(url, headers=None, json=None, data=None, files=None):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        if url.endswith("/assets/bulk-upload-check"):
+            resp.json.return_value = {
+                "results": [{"id": e["id"], "action": "accept"} for e in json["assets"]]
+            }
+        elif url.endswith("/assets"):
+            immich_uploads.append(files["assetData"][0])
+            resp.json.return_value = {"id": f"im-{len(immich_uploads)}", "status": "created"}
+        elif "/albums" in url:
+            albums_api_calls.append(f"POST {url}")
+            resp.json.return_value = {"id": "alb-x"}
+        return resp
+
+    def fake_put(url, headers=None, json=None):
+        albums_api_calls.append(f"PUT {url}")
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    mock_http.get.side_effect = fake_get
+    mock_http.post.side_effect = fake_post
+    mock_http.put.side_effect = fake_put
+
+    source_rec = LocalProvider(root_dir=src_root, recursive=True)
+    immich = ImmichProvider(base_url="http://localhost:2283", api_key="k", http_client=mock_http)
+    sync_flat_imgs = PhotoSynchronizer(
+        sync_albums=False, images_only=True, on_progress=lambda _: None
+    )
+    res = sync_flat_imgs.sync(source_rec, immich)
+    assert sorted(immich_uploads) == ["root.jpg", "sub.jpg"]
+    assert albums_api_calls == []
+    assert len(res.albums_updated) == 0
+
+    # 2. --no-recursive: only root.jpg is scanned, sub_dir is ignored
+    immich_uploads.clear()
+    source_nonrec = LocalProvider(root_dir=src_root, recursive=False)
+    immich2 = ImmichProvider(base_url="http://localhost:2283", api_key="k", http_client=mock_http)
+    res_nr = sync_flat_imgs.sync(source_nonrec, immich2)
+    assert immich_uploads == ["root.jpg"]
+    assert len(res_nr.copied) == 1
+
+    # 3. Generic local -> local with sync_albums=False copies to _library/ without creating albums/
+    dst_root = tmp_path / "dst"
+    dst_local = LocalProvider(root_dir=dst_root)
+    res_loc = sync_flat_imgs.sync(source_rec, dst_local)
+    assert len(res_loc.copied) == 2
+    assert (dst_root / "_library" / "2025" / "05" / "root.jpg").exists()
+    assert (dst_root / "_library" / "2025" / "05" / "sub.jpg").exists()
+    assert not (dst_root / "albums").exists()
+
+
+def test_sidecar_name_too_long_and_error_log_continuation(tmp_path: Path, monkeypatch) -> None:
+    """Verify ENAMETOOLONG on sidecar lookup doesn't crash, and upload errors log to error.log and continue."""
+    import errno
+
+    src_root = tmp_path / "src"
+    src_root.mkdir()
+    img1 = _create_sample_jpeg(src_root / "a_bad.jpg", "2025:05:01 10:00:00", (10, 20, 30))
+    img2 = _create_sample_jpeg(src_root / "b_good.jpg", "2025:05:02 11:00:00", (40, 50, 60))
+
+    # 1. Simulate eCryptfs ENAMETOOLONG when checking `.supplemental-metadata.json` sidecar
+    orig_is_file = Path.is_file
+
+    def fake_is_file(self: Path) -> bool:
+        if self.name.endswith(".supplemental-metadata.json"):
+            raise OSError(errno.ENAMETOOLONG, "File name too long", str(self))
+        return orig_is_file(self)
+
+    monkeypatch.setattr(Path, "is_file", fake_is_file)
+    # Create an image with no EXIF so extract_image_metadata reaches sidecar lookup
+    from PIL import Image
+    no_exif = src_root / "c_long_noexif.jpg"
+    Image.new("RGB", (16, 16), (90, 90, 90)).save(no_exif, format="JPEG")
+    w, h, dt, _ = LocalProvider.extract_image_metadata(no_exif)
+    assert (w, h) == (16, 16)
+    assert dt is not None
+
+    # 2. Simulate upload failure on a_bad.jpg while b_good.jpg and c_long_noexif.jpg succeed
+    uploaded_names: list[str] = []
+    mock_http = MagicMock()
+
+    def fake_post(url, headers=None, json=None, data=None, files=None):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        if url.endswith("/assets/bulk-upload-check"):
+            resp.json.return_value = {
+                "results": [{"id": e["id"], "action": "accept"} for e in json["assets"]]
+            }
+        elif url.endswith("/assets"):
+            fname = files["assetData"][0]
+            if fname == "a_bad.jpg":
+                raise RuntimeError("Simulated Immich 500 error")
+            uploaded_names.append(fname)
+            resp.json.return_value = {"id": f"im-{len(uploaded_names)}", "status": "created"}
+        return resp
+
+    mock_http.post.side_effect = fake_post
+
+    err_log = tmp_path / "error.log"
+    source = LocalProvider(root_dir=src_root)
+    immich = ImmichProvider(base_url="http://localhost:2283", api_key="k", http_client=mock_http)
+    syncer = PhotoSynchronizer(
+        sync_albums=False,
+        error_log_path=err_log,
+        on_progress=lambda _: None,
+    )
+    res = syncer.sync(source, immich)
+
+    assert sorted(uploaded_names) == ["b_good.jpg", "c_long_noexif.jpg"]
+    assert len(res.copied) == 2
+    assert len(res.errors) == 1
+    assert err_log.exists()
+    log_text = err_log.read_text(encoding="utf-8")
+    assert "a_bad.jpg" in log_text
+    assert "Simulated Immich 500 error" in log_text
+
+
+def test_youtube_ssl_eof_retry_and_error_log(tmp_path: Path, monkeypatch) -> None:
+    """Verify YouTubeProvider retries transient SSLEOFError automatically and logs persistent errors without aborting."""
+    import ssl
+    from crosspix.youtube import YouTubeProvider
+
+    monkeypatch.setattr("crosspix.youtube.time.sleep", lambda _: None)
+
+    yt_service, yt_videos, yt_playlists, _ = _make_fake_youtube_service()
+
+    # Inject a transient SSLEOFError on the first videos().insert(...).next_chunk() call
+    orig_videos_insert = yt_service.videos.return_value.insert.side_effect
+    call_state = {"ssl_failed_once": False}
+
+    def flaky_videos_insert(part, body, media_body):
+        inner = orig_videos_insert(part, body, media_body)
+
+        class _FlakyInsert:
+            resumable_uri = "https://upload.example/session-1"
+
+            def next_chunk(self):
+                if not call_state["ssl_failed_once"]:
+                    call_state["ssl_failed_once"] = True
+                    raise ssl.SSLEOFError("EOF occurred in violation of protocol (_ssl.c:2417)")
+                return inner.next_chunk()
+
+        return _FlakyInsert()
+
+    yt_service.videos.return_value.insert.side_effect = flaky_videos_insert
+
+    root = tmp_path / "Ente"
+    alb = root / "albums" / "Famille"
+    alb.mkdir(parents=True)
+    vid = alb / "clip.mp4"
+    vid.write_bytes(b"\x02" * 200_000)
+
+    source = LocalProvider(root_dir=root, albums_only=True)
+    yt = YouTubeProvider(service=yt_service, on_progress=lambda _: None)
+    err_log = tmp_path / "error.log"
+    syncer = PhotoSynchronizer(error_log_path=err_log, on_progress=lambda _: None)
+
+    res = syncer.sync(source, yt)
+    assert call_state["ssl_failed_once"] is True
+    assert len(res.copied) == 1
+    assert len(res.errors) == 0
+    assert len(yt_videos) == 1
+
+
+
+
+
+
+
 
 
 

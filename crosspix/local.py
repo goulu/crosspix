@@ -125,6 +125,83 @@ class LocalProvider(PhotoProvider):
         return self.album_delimiter.join(rel_dir.parts)
 
     @staticmethod
+    def compute_sha1_hex(file_path: Path) -> str:
+        """Compute the SHA-1 hex digest of a local file (Immich native deduplication hash)."""
+        h1 = hashlib.sha1()
+        with file_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                h1.update(chunk)
+        return h1.hexdigest()
+
+    def iter_streaming_folders(
+        self, album: Optional[str] = None
+    ) -> Iterable[tuple[Optional[str], list[Path]]]:
+        """Yield `(album_name, media_paths)` folder-by-folder without scanning the whole tree upfront.
+
+        When `self.albums_only` is True, traverses only `albums/` (skipping `_library/`,
+        hidden folders such as `.meta/`, and `metadata/`). Otherwise traverses `albums/`
+        first and then the rest of `root_dir` (e.g. `_library/`).
+        """
+        if not self.root_dir.exists():
+            return
+
+        roots_to_walk: list[Path] = []
+        if not self.recursive:
+            roots_to_walk.append(self.root_dir)
+        elif self.albums_only:
+            if self.albums_root.exists():
+                roots_to_walk.append(self.albums_root)
+        else:
+            if self.albums_root.exists():
+                roots_to_walk.append(self.albums_root)
+            roots_to_walk.append(self.root_dir)
+
+        visited_dirs: set[Path] = set()
+        for walk_start in roots_to_walk:
+            for walk_root, dirnames, filenames in os.walk(walk_start, topdown=True):
+                rp = Path(walk_root)
+                if rp in visited_dirs:
+                    dirnames[:] = []
+                    continue
+                visited_dirs.add(rp)
+
+                if not self.recursive:
+                    dirnames[:] = []
+                else:
+                    pruned: list[str] = []
+                    for d in sorted(dirnames):
+                        if d.startswith(".") or d == "metadata":
+                            continue
+                        sub = rp / d
+                        if sub in visited_dirs:
+                            continue
+                        pruned.append(d)
+                    dirnames[:] = pruned
+
+                if not filenames:
+                    continue
+
+                media_paths: list[Path] = []
+                for fname in sorted(filenames):
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext not in SUPPORTED_EXTENSIONS:
+                        continue
+                    p = rp / fname
+                    if p.exists() and (p.is_file() or p.is_symlink()):
+                        media_paths.append(p)
+
+                if not media_paths:
+                    continue
+
+                album_name = self._extract_album_from_path(media_paths[0])
+                if self.albums_only and not album_name:
+                    continue
+                if album and album_name != album:
+                    continue
+
+                yield album_name, media_paths
+
+    @staticmethod
     def compute_sha256(file_path: Path) -> str:
         """Compute the SHA-256 hex digest of a local file."""
         digest = hashlib.sha256()
@@ -202,31 +279,35 @@ class LocalProvider(PhotoProvider):
                 file_path.with_name(f"{file_path.name}.supplemental-metadata.json"),
             ]
             for sidecar in sidecar_candidates:
-                if sidecar.is_file():
-                    try:
-                        meta_json = json.loads(sidecar.read_text(encoding="utf-8"))
-                        ts_info = (
-                            meta_json.get("photoTakenTime")
-                            or meta_json.get("creationTime")
-                            or {}
-                        )
-                        ts_val = (
-                            ts_info.get("timestamp")
-                            if isinstance(ts_info, dict)
-                            else ts_info
-                        )
-                        if ts_val is not None:
-                            ts_float = float(ts_val)
-                            if ts_float > 1e12:
-                                ts_float /= 1_000_000.0
-                            created_at = datetime.fromtimestamp(ts_float)
-                            break
-                    except Exception:
-                        pass
+                try:
+                    if not sidecar.is_file():
+                        continue
+                    meta_json = json.loads(sidecar.read_text(encoding="utf-8"))
+                    ts_info = (
+                        meta_json.get("photoTakenTime")
+                        or meta_json.get("creationTime")
+                        or {}
+                    )
+                    ts_val = (
+                        ts_info.get("timestamp")
+                        if isinstance(ts_info, dict)
+                        else ts_info
+                    )
+                    if ts_val is not None:
+                        ts_float = float(ts_val)
+                        if ts_float > 1e12:
+                            ts_float /= 1_000_000.0
+                        created_at = datetime.fromtimestamp(ts_float)
+                        break
+                except Exception:
+                    pass
 
         if created_at is None:
-            stat = file_path.stat()
-            created_at = datetime.fromtimestamp(stat.st_mtime)
+            try:
+                stat = file_path.stat()
+                created_at = datetime.fromtimestamp(stat.st_mtime)
+            except OSError:
+                created_at = None
 
         return width, height, created_at, exif_summary
 

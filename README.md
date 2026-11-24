@@ -5,6 +5,7 @@
 - **Google Photos** (`crosspix/google_photos.py`)
 - **Ente Photos** (`crosspix/ente.py`)
 - **Immich** (`crosspix/immich.py`)
+- **YouTube** (`crosspix/youtube.py`)
 - **Local Folders** (`crosspix/local.py`)
 
 Each platform is implemented in its own dedicated module using established PyPI packages and adheres to a unified `PhotoProvider` interface, enabling seamless one-way (`sync`) or bi-directional (`bisync`) synchronization between any pair of platforms into a single shared local directory without duplicating files.
@@ -59,7 +60,8 @@ Photos/
 | **Local Folders** | `crosspix/local.py` | `Pillow` (`PIL`), `piexif` | Stores canonical files in `_library/YYYY/MM/`; links into `albums/<part1>/<part2>/` via `os.link` (hardlink) or `os.symlink`; supports `--albums-only` to scan only `albums/` (skipping `_library/`, `.meta/`, and `metadata/`); deduplicates by inode, `SHA-256`, `SHA-512` (Base64), and `SHA-1` (Base64); reads EXIF and Ente/Takeout sidecar JSON timestamps. |
 | **Google Photos** | `crosspix/google_photos.py` | `gphotospy`, `google-api-python-client`, `google-auth-oauthlib`, `requests` | Supports OAuth2 Library API + automatic fallback to the **Google Photos Picker API** (`photospicker.googleapis.com` for post-March 2025 scopes), plus full automatic import of photos & albums from a **Google Takeout** directory (`--google-takeout`). |
 | **Ente Photos** | `crosspix/ente.py` | `PyNaCl` (`nacl`), `httpx`, `requests` | **Selective CLI mode (`ente-cli v0.4.5+`)**: fetches album/file metadata & `SHA-512` hashes via `ente photos album list --all --json` and `ente photos file list --all --json --offline`, and downloads **only missing files** via `ente photos file download`. Also supports local export folders and the E2EE Museum API. |
-| **Immich** | `crosspix/immich.py` | `immichpy`, `httpx` | Paginates `search_assets` and enriches album memberships via `get_all_albums`; matches local assets by Immich's native `SHA-1` Base64 checksum (`x-immich-checksum`); uploads once via `POST /assets` and attaches to all albums via `PUT /albums/{id}/assets`. |
+| **Immich** | `crosspix/immich.py` | `immichpy`, `httpx` | Streams local albums directly via `POST /assets/bulk-upload-check` (resumable, no upfront full scan); uploads once via `POST /assets` with `x-immich-checksum` and attaches to albums via `PUT /albums/{id}/assets`. |
+| **YouTube** | `crosspix/youtube.py` | `google-api-python-client`, `google-auth-oauthlib` | Resumable chunked video uploads via YouTube Data API v3 (`private` by default); maps crosspix albums to YouTube playlists; embeds `crosspix_sha1` in descriptions for deduplication and resumability. |
 
 ---
 
@@ -84,6 +86,9 @@ pip install -e ".[dev]"
 - `--album-delimiter " "` (default: space `" "`): splits remote album names into nested local directories under `albums/` and joins nested folder names back into remote album titles.
 - `--link-mode {hardlink,symlink,copy}` (default: `hardlink`): controls how files in `albums/...` reference the canonical file in `_library/YYYY/MM/`.
 - `--albums-only`: when reading from a local source, scans only `albums/` (ignoring unlinked files in `_library/`, hidden directories such as `.meta/`, and `metadata/`). Hardlinked photos shared across multiple albums are still uploaded once and linked to all their albums.
+- `--no-albums`: synchronizes files only without creating or linking albums/folders/playlists on the target (useful e.g. when uploading `_library/` or flat folders to Immich without turning subdirectories into albums).
+- `--images-only`: synchronizes image files only and skips all videos.
+- `--no-recursive`: scans only the specified local directory without descending into subdirectories.
 
 ---
 
@@ -156,8 +161,34 @@ Provide your Immich server URL (default: `http://localhost:2283/api`; `/api` is 
 # Sync full local library + albums to Immich (reads API key from immich.token)
 .venv/bin/python -m crosspix sync local:/home/goulu/Images/Ente immich:http://localhost:2283
 
-# Sync ONLY albums and their photos to Immich (skip unlinked photos in _library/)
+# Sync ONLY albums and their photos to Immich (skip unlinked photos in _library/ and videos > 100 MB by default)
 .venv/bin/python -m crosspix sync local:/home/goulu/Images/Ente immich:http://localhost:2283 --albums-only
+
+# Sync to Immich without any video size limit (--max-video-size-mb 0)
+.venv/bin/python -m crosspix sync local:/home/goulu/Images/Ente immich:http://localhost:2283 --albums-only --max-video-size-mb 0
+
+# Sync to Immich AND automatically upload videos > 100 MB to YouTube playlists in one pass
+.venv/bin/python -m crosspix sync local:/home/goulu/Images/Ente immich:http://localhost:2283 --albums-only --max-video-size-mb 100 --youtube-large-videos
+```
+
+---
+
+### 5. YouTube (`youtube`) & Large Video Filtering
+By default, `crosspix sync` to non-YouTube targets skips video files larger than **100 MB** (`--max-video-size-mb 100`, pass `0` to disable). You can synchronize those large videos (or all videos) directly to YouTube, organized into playlists matching your album names:
+
+1. In [Google Cloud Console](https://console.cloud.google.com/), enable **YouTube Data API v3** on your project (you can reuse `gphoto_oauth.json` or save a dedicated `youtube_oauth.json`, gitignored via `*oauth*.json`).
+2. On first run, your browser opens for OAuth consent and caches the token in `youtube.token` (gitignored via `*.token`).
+3. Uploaded videos and created playlists default to **`private`** (configurable via `--youtube-privacy {private,unlisted,public}`), and embed `crosspix_sha1` in the description so re-runs skip already-uploaded videos automatically.
+
+```bash
+# Sync ONLY videos >= 100 MB from albums/ to private YouTube playlists
+.venv/bin/python -m crosspix sync local:/home/goulu/Images/Ente youtube --albums-only --min-video-size-mb 100
+
+# Preview which large videos would be uploaded to YouTube
+.venv/bin/python -m crosspix sync local:/home/goulu/Images/Ente youtube --albums-only --min-video-size-mb 100 --dry-run
+
+# Sync to Immich (photos + videos <= 100 MB) and route videos > 100 MB to YouTube in one command
+.venv/bin/python -m crosspix sync local:/home/goulu/Images/Ente immich:http://localhost:2283 --albums-only --youtube-large-videos --youtube-privacy unlisted
 ```
 
 ---

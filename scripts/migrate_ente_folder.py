@@ -40,7 +40,14 @@ def _find_sidecars(file_path: Path) -> list[Path]:
         file_path.with_name(f"{file_path.name}.json"),
         file_path.with_name(f"{file_path.name}.supplemental-metadata.json"),
     ]
-    return [c for c in candidates if c.is_file()]
+    found: list[Path] = []
+    for c in candidates:
+        try:
+            if c.is_file():
+                found.append(c)
+        except OSError:
+            pass
+    return found
 
 
 def _same_file_content(

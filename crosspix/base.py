@@ -8,6 +8,30 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+VIDEO_EXTENSIONS = {
+    ".mp4",
+    ".mov",
+    ".m4v",
+    ".3gp",
+    ".avi",
+    ".mkv",
+    ".webm",
+    ".mts",
+    ".m2ts",
+}
+
+
+def is_video_filename(filename: str) -> bool:
+    """Return True if the filename has a recognized video extension."""
+    return Path(filename).suffix.lower() in VIDEO_EXTENSIONS
+
+
+def is_video_item(item: "PhotoItem") -> bool:
+    """Return True if a PhotoItem represents a video based on MIME type or filename."""
+    if item.mime_type and item.mime_type.lower().startswith("video/"):
+        return True
+    return is_video_filename(item.filename)
+
 
 @dataclass
 class PhotoItem:

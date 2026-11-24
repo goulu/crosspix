@@ -35,6 +35,8 @@ class ImmichProvider(PhotoProvider):
         self.http_client = http_client or httpx.Client(timeout=300.0)
         self.include_albums = include_albums
         self._album_cache: dict[str, str] = {}
+        self._album_assets_cache: dict[str, set[str]] = {}
+        self._albums_prefetched: bool = False
 
     def connect(self) -> None:
         """Verify configuration for the Immich server."""
@@ -120,11 +122,9 @@ class ImmichProvider(PhotoProvider):
             raw_metadata=raw_meta,
         )
 
-    def _resolve_album_id(self, album_name: str, create_if_missing: bool = False) -> Optional[str]:
-        """Resolve an Immich album title to its UUID, optionally creating it if missing."""
-        if album_name in self._album_cache:
-            return self._album_cache[album_name]
-
+    def prefetch_albums(self) -> dict[str, str]:
+        """Fetch and cache all existing Immich albums in a single request."""
+        self.connect()
         resp = self.http_client.get(
             f"{self.base_url}/albums",
             headers=self._headers(),
@@ -136,6 +136,79 @@ class ImmichProvider(PhotoProvider):
                 alb_id = alb.get("id")
                 if title and alb_id:
                     self._album_cache[str(title)] = str(alb_id)
+        self._albums_prefetched = True
+        return dict(self._album_cache)
+
+    def get_album_asset_ids(self, album_id: str) -> set[str]:
+        """Return (and cache) the set of asset UUIDs currently in an Immich album."""
+        if album_id in self._album_assets_cache:
+            return self._album_assets_cache[album_id]
+        resp = self.http_client.get(
+            f"{self.base_url}/albums/{album_id}",
+            headers=self._headers(),
+            params={"withoutAssets": "false"},
+        )
+        resp.raise_for_status()
+        payload = resp.json() or {}
+        assets = payload.get("assets") or []
+        ids = {
+            str(a.get("id"))
+            for a in assets
+            if isinstance(a, dict) and a.get("id")
+        }
+        self._album_assets_cache[album_id] = ids
+        return ids
+
+    def check_bulk_upload(
+        self, items: list[tuple[str, str]]
+    ) -> dict[str, tuple[str, Optional[str]]]:
+        """Check a batch of `(client_id, sha1_checksum)` pairs against Immich.
+
+        Returns `{client_id: (action, existing_asset_id)}` where `action` is
+        typically `"accept"` or `"reject"` (with `existing_asset_id` set on duplicates).
+        """
+        self.connect()
+        if not items:
+            return {}
+        resp = self.http_client.post(
+            f"{self.base_url}/assets/bulk-upload-check",
+            headers=self._headers(),
+            json={
+                "assets": [
+                    {"id": client_id, "checksum": checksum}
+                    for client_id, checksum in items
+                ]
+            },
+        )
+        resp.raise_for_status()
+        payload = resp.json() or {}
+        out: dict[str, tuple[str, Optional[str]]] = {}
+        for entry in payload.get("results") or []:
+            if not isinstance(entry, dict):
+                continue
+            cid = str(entry.get("id", ""))
+            action = str(entry.get("action", "accept")).lower()
+            asset_id = entry.get("assetId") or entry.get("asset_id")
+            out[cid] = (action, str(asset_id) if asset_id else None)
+        return out
+
+    def _resolve_album_id(self, album_name: str, create_if_missing: bool = False) -> Optional[str]:
+        """Resolve an Immich album title to its UUID, optionally creating it if missing."""
+        if album_name in self._album_cache:
+            return self._album_cache[album_name]
+
+        if not self._albums_prefetched:
+            resp = self.http_client.get(
+                f"{self.base_url}/albums",
+                headers=self._headers(),
+            )
+            resp.raise_for_status()
+            for alb in resp.json() or []:
+                if isinstance(alb, dict):
+                    title = alb.get("albumName") or alb.get("album_name")
+                    alb_id = alb.get("id")
+                    if title and alb_id:
+                        self._album_cache[str(title)] = str(alb_id)
 
         if album_name in self._album_cache:
             return self._album_cache[album_name]
@@ -149,21 +222,30 @@ class ImmichProvider(PhotoProvider):
             create_resp.raise_for_status()
             alb_id = create_resp.json().get("id")
             if alb_id:
-                self._album_cache[album_name] = str(alb_id)
-                return str(alb_id)
+                alb_id_str = str(alb_id)
+                self._album_cache[album_name] = alb_id_str
+                self._album_assets_cache.setdefault(alb_id_str, set())
+                return alb_id_str
 
         return None
 
     def _add_asset_to_album(self, asset_id: str, album_id: str) -> None:
         """Attach an existing Immich asset ID to an album without re-uploading."""
-        if not asset_id or not album_id:
+        self.add_assets_to_album(album_id, [asset_id])
+
+    def add_assets_to_album(self, album_id: str, asset_ids: list[str]) -> None:
+        """Attach one or more Immich asset IDs to an album without re-uploading."""
+        ids = [aid for aid in asset_ids if aid]
+        if not album_id or not ids:
             return
         resp = self.http_client.put(
             f"{self.base_url}/albums/{album_id}/assets",
             headers=self._headers(),
-            json={"ids": [asset_id]},
+            json={"ids": ids},
         )
         resp.raise_for_status()
+        if album_id in self._album_assets_cache:
+            self._album_assets_cache[album_id].update(ids)
 
     async def _list_photos_async(self, album: Optional[str] = None) -> list[PhotoItem]:
         async with self._create_async_client() as client:
@@ -189,7 +271,7 @@ class ImmichProvider(PhotoProvider):
             page = 1
             while True:
                 query = MetadataSearchDto(size=1000, page=page)
-                results = await client.search.search_assets(body=query)
+                results = await client.search.search_assets(metadata_search_dto=query)
                 assets_obj = getattr(results, "assets", results)
                 items = getattr(assets_obj, "items", assets_obj)
                 if isinstance(items, list):
@@ -287,16 +369,20 @@ class ImmichProvider(PhotoProvider):
             target_albums.append(album)
 
         data = {
-            "deviceAssetId": f"crosspix-{filename}-{int(stat.st_mtime)}",
+            "deviceAssetId": f"crosspix-{filename}-{stat.st_size}-{int(stat.st_mtime)}",
             "deviceId": "crosspix-python",
             "fileCreatedAt": created_at.isoformat() + "Z",
             "fileModifiedAt": datetime.fromtimestamp(stat.st_mtime).isoformat() + "Z",
             "isFavorite": "false",
         }
         upload_headers = self._headers()
-        sha1_b64 = item.raw_metadata.get("sha1_b64") if item else None
-        if isinstance(sha1_b64, str) and sha1_b64:
-            upload_headers["x-immich-checksum"] = sha1_b64
+        sha1_checksum = (
+            (item.raw_metadata.get("sha1_hex") or item.raw_metadata.get("sha1_b64"))
+            if item
+            else None
+        )
+        if isinstance(sha1_checksum, str) and sha1_checksum:
+            upload_headers["x-immich-checksum"] = sha1_checksum
 
         with file_path.open("rb") as handle:
             files = {
