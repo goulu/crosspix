@@ -445,6 +445,17 @@ def _iter_album_dirs(albums_root: Path):
             stack.append(sd)
 
 
+def _resolve_link_target(base_dir: Path, raw_target: str) -> Path:
+    """Resolve a (possibly broken) symlink target relative to `base_dir` portably across OSes."""
+    cleaned = raw_target[4:] if raw_target.startswith("\\\\?\\") else raw_target
+    raw = Path(cleaned)
+    combined = raw if raw.is_absolute() else Path(os.path.normpath(str(base_dir / raw)))
+    try:
+        return combined.resolve(strict=False)
+    except OSError:
+        return combined
+
+
 def _find_canonical_for_orphan(
     link_path: Path,
     library_by_short_key: dict[tuple[str, str], list[Path]],
@@ -454,7 +465,7 @@ def _find_canonical_for_orphan(
     if link_path.is_symlink():
         try:
             raw_target = os.readlink(link_path)
-            resolved = (link_path.parent / raw_target).resolve(strict=False)
+            resolved = _resolve_link_target(link_path.parent, raw_target)
             if resolved.is_relative_to(library_root):
                 v = parse_variant(resolved, size=0)
                 cand_dir = resolved.parent
@@ -721,7 +732,7 @@ def deduplicate_library_variants(
             if is_sym:
                 try:
                     raw_target = os.readlink(link_path)
-                    resolved_target = (album_dir / raw_target).resolve(strict=False)
+                    resolved_target = _resolve_link_target(album_dir, raw_target)
                 except OSError:
                     continue
 
@@ -739,7 +750,9 @@ def deduplicate_library_variants(
                         is_orphan_or_broken = True
             else:
                 try:
-                    st = entry.stat(follow_symlinks=False)
+                    # Use os.lstat() rather than DirEntry.stat(): on Windows, DirEntry.stat()
+                    # leaves st_dev, st_ino, and st_nlink as 0.
+                    st = link_path.lstat()
                 except OSError:
                     continue
                 ino = (st.st_dev, st.st_ino)

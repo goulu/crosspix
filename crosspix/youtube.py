@@ -545,37 +545,45 @@ class YouTubeProvider(PhotoProvider):
         size_mb = st.st_size / (1024 * 1024)
         chunk_retries = 0
         max_chunk_retries = 5
-        while response is None:
-            try:
-                status, response = request.next_chunk()
-                chunk_retries = 0
-            except Exception as exc:
-                if chunk_retries >= max_chunk_retries or not self._is_transient_error(exc):
-                    raise
-                chunk_retries += 1
-                delay = min(2**chunk_retries, 16)
-                self._log(
-                    f"  [YouTube] Transient upload error on '{filename}' ({exc}); "
-                    f"retrying chunk in {delay}s ({chunk_retries}/{max_chunk_retries})..."
-                )
-                time.sleep(delay)
-                # Rebuild upload request only if session hasn't even started (resumable_uri is None)
-                if getattr(request, "resumable_uri", None) is None:
-                    self._reset_service()
-                    request = self.service.videos().insert(
-                        part="snippet,status",
-                        body=body,
-                        media_body=media,
-                    )
-                continue
-
-            if status is not None:
-                pct = int(status.progress() * 100)
-                if pct >= last_pct + 10 or pct == 100:
+        try:
+            while response is None:
+                try:
+                    status, response = request.next_chunk()
+                    chunk_retries = 0
+                except Exception as exc:
+                    if chunk_retries >= max_chunk_retries or not self._is_transient_error(exc):
+                        raise
+                    chunk_retries += 1
+                    delay = min(2**chunk_retries, 16)
                     self._log(
-                        f"  [YouTube] Uploading '{filename}' ({size_mb:.1f} MB): {pct}%"
+                        f"  [YouTube] Transient upload error on '{filename}' ({exc}); "
+                        f"retrying chunk in {delay}s ({chunk_retries}/{max_chunk_retries})..."
                     )
-                    last_pct = pct
+                    time.sleep(delay)
+                    # Rebuild upload request only if session hasn't even started (resumable_uri is None)
+                    if getattr(request, "resumable_uri", None) is None:
+                        self._reset_service()
+                        request = self.service.videos().insert(
+                            part="snippet,status",
+                            body=body,
+                            media_body=media,
+                        )
+                    continue
+
+                if status is not None:
+                    pct = int(status.progress() * 100)
+                    if pct >= last_pct + 10 or pct == 100:
+                        self._log(
+                            f"  [YouTube] Uploading '{filename}' ({size_mb:.1f} MB): {pct}%"
+                        )
+                        last_pct = pct
+        finally:
+            fd = getattr(media, "_fd", None)
+            if fd is not None and not getattr(fd, "closed", True):
+                try:
+                    fd.close()
+                except OSError:
+                    pass
 
         video_id = str((response or {}).get("id", ""))
         for pl_name in target_albums:

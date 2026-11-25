@@ -103,7 +103,8 @@ def test_multi_album_space_hierarchy_and_hardlink_deduplication(tmp_path: Path) 
     listed = list(provider.list_photos())
     assert len(listed) == 1
     assert listed[0].filename == "rome.jpg"
-    assert listed[0].local_path == canonical_file
+    assert listed[0].local_path is not None
+    assert listed[0].local_path.resolve() == canonical_file.resolve()
     assert sorted(listed[0].albums) == ["Famille Eté Favoris", "Vacances 2026 Italie"]
 
     # Adding a third album afterwards via sync_albums must create a new hardlink without copying

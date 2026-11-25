@@ -41,4 +41,4 @@ jobs:
           python scripts/fix_dates_from_filenames.py --help
 
       - name: Run pytest suite
-        run: python -m pytest -v
+        run: python -m pytest -v --tb=short
