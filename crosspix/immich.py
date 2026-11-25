@@ -192,6 +192,27 @@ class ImmichProvider(PhotoProvider):
             out[cid] = (action, str(asset_id) if asset_id else None)
         return out
 
+    def get_asset_info(self, asset_id: str) -> dict[str, Any]:
+        """Fetch full metadata for a single Immich asset (`GET /assets/{id}`)."""
+        self.connect()
+        resp = self.http_client.get(
+            f"{self.base_url}/assets/{asset_id}",
+            headers=self._headers(),
+        )
+        resp.raise_for_status()
+        return resp.json() or {}
+
+    def update_asset_date(self, asset_id: str, date_time_original: str) -> dict[str, Any]:
+        """Update an Immich asset's `dateTimeOriginal` via `PUT /assets/{id}`."""
+        self.connect()
+        resp = self.http_client.put(
+            f"{self.base_url}/assets/{asset_id}",
+            headers=self._headers(),
+            json={"dateTimeOriginal": date_time_original},
+        )
+        resp.raise_for_status()
+        return resp.json() or {}
+
     def _resolve_album_id(self, album_name: str, create_if_missing: bool = False) -> Optional[str]:
         """Resolve an Immich album title to its UUID, optionally creating it if missing."""
         if album_name in self._album_cache:

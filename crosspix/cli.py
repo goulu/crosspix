@@ -246,6 +246,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the error log file where skipped file errors are recorded (default: error.log).",
     )
     sync_parser.add_argument(
+        "--largest-first",
+        action="store_true",
+        help=(
+            "For YouTube exports, upload videos in descending order of file size using a "
+            "cached video index to avoid rescanning on subsequent launches."
+        ),
+    )
+    sync_parser.add_argument(
+        "--video-index",
+        default=None,
+        help=(
+            "Optional JSON index path used with --largest-first "
+            "(default: <source>/.crosspix_video_index.json)."
+        ),
+    )
+    sync_parser.add_argument(
+        "--refresh-video-index",
+        action="store_true",
+        help="Force rebuilding the cached video index used with --largest-first.",
+    )
+    sync_parser.add_argument(
         "--youtube-large-videos",
         action="store_true",
         help=(
@@ -312,6 +333,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                 sync_albums=not args.no_albums,
                 images_only=args.images_only,
                 error_log_path=args.error_log,
+                largest_first=args.largest_first,
+                video_index_path=args.video_index,
+                refresh_video_index=args.refresh_video_index,
             )
 
             if args.bidirectional:

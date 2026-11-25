@@ -34,6 +34,31 @@ def _default_log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def is_youtube_rate_limit_error(exc: Exception) -> bool:
+    """Return True if `exc` is a YouTube rate-limit, daily upload-limit, or quota error.
+
+    Matches HTTP 429, `uploadLimitExceeded` (HTTP 400 "The user has exceeded the number of
+    videos they may upload."), `quotaExceeded`, `dailyLimitExceeded`, and `rateLimitExceeded`.
+    """
+    if isinstance(exc, HttpError):
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        if status == 429:
+            return True
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "httperror 429",
+            "http error 429",
+            "uploadlimitexceeded",
+            "exceeded the number of videos they may upload",
+            "quotaexceeded",
+            "dailylimitexceeded",
+            "ratelimitexceeded",
+        )
+    )
+
+
 def _sanitize_youtube_title(raw_title: str) -> str:
     """Clean a title to satisfy YouTube's 100-char limit and disallowed character rules."""
     cleaned = raw_title.replace("<", "").replace(">", "").strip()

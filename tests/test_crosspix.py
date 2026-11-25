@@ -640,9 +640,17 @@ def test_deduplicate_library_variants_priority_and_album_links(tmp_path: Path) -
 
     # Phase 2 standalone repair test (--albums-only): broken symlink + orphaned nlink==1 hardlink
     broken_sym = alb_vac / "20140726_104622_14735170026_o.jpg"
-    os.symlink(os.path.relpath(lib_dir / "20140726_104622_14735170026_o.jpg", alb_vac), broken_sym)
-    # Remove the valid link in alb_vac first so the broken symlink is restored as the album link
-    (alb_vac / "20140726_104622.jpg").unlink()
+    can_symlink = True
+    try:
+        os.symlink(
+            os.path.relpath(lib_dir / "20140726_104622_14735170026_o.jpg", alb_vac),
+            broken_sym,
+        )
+        # Remove the valid link in alb_vac first so the broken symlink is restored as the album link
+        (alb_vac / "20140726_104622.jpg").unlink()
+    except OSError:
+        # Non-admin Windows environments may disallow symlinks
+        can_symlink = False
 
     alb_orphan = root / "albums" / "Orphans"
     alb_orphan.mkdir(parents=True)
@@ -650,10 +658,11 @@ def test_deduplicate_library_variants_priority_and_album_links(tmp_path: Path) -
     orphan_copy.write_bytes(b"stale-orphan-copy")
 
     repair_stats = deduplicate_library_variants(root_dir=root, albums_only=True)
-    assert repair_stats["broken_links_repaired"] == 2
-    assert (alb_vac / "20140726_104622.jpg").is_symlink()
-    assert (alb_vac / "20140726_104622.jpg").resolve() == g1_final.resolve()
-    assert not broken_sym.exists()
+    assert repair_stats["broken_links_repaired"] == (2 if can_symlink else 1)
+    if can_symlink:
+        assert (alb_vac / "20140726_104622.jpg").is_symlink()
+        assert (alb_vac / "20140726_104622.jpg").resolve() == g1_final.resolve()
+        assert not broken_sym.exists()
     assert (alb_orphan / "20140727_120000.jpg").stat().st_ino == g2_mod_ino
     assert not orphan_copy.exists()
 
@@ -1243,6 +1252,229 @@ def test_youtube_ssl_eof_retry_and_error_log(tmp_path: Path, monkeypatch) -> Non
     assert len(res.copied) == 1
     assert len(res.errors) == 0
     assert len(yt_videos) == 1
+
+
+def test_fix_dates_from_filenames_local_and_immich(tmp_path: Path) -> None:
+    """Verify filename date parsing (including PXL_...ms and date-only -> 12:00:00), local mtime, and Immich update."""
+    from datetime import datetime
+    import os
+    from scripts.fix_dates_from_filenames import (
+        extract_datetime_from_filename,
+        fix_dates_from_filenames,
+    )
+
+    # 1. Parsing checks
+    assert extract_datetime_from_filename("PXL_20260821_082337164.mp4") == datetime(2026, 8, 21, 8, 23, 37)
+    assert extract_datetime_from_filename("20150702_201509_18738559163_o.jpg") == datetime(2015, 7, 2, 20, 15, 9)
+    assert extract_datetime_from_filename("IMG-20160221-WA0012.jpeg") == datetime(2016, 2, 21, 12, 0, 0)
+    assert extract_datetime_from_filename("Screenshot_2014-12-18-21-19-21.png") == datetime(2014, 12, 18, 21, 19, 21)
+    assert extract_datetime_from_filename("20160221_14735170026_o.jpg") == datetime(2016, 2, 21, 12, 0, 0)
+    assert extract_datetime_from_filename("daubensee-gemmi_314066442_o.jpg") is None
+
+    # 2. Local mtime + Immich dateTimeOriginal updates
+    lib = tmp_path / "_library" / "2026" / "08"
+    lib.mkdir(parents=True)
+    pxl = lib / "PXL_20260821_082337164.mp4"
+    pxl.write_bytes(b"video-bytes-pxl")
+    wa = lib / "IMG-20160221-WA0012.jpg"
+    wa.write_bytes(b"wa-bytes")
+    nodate = lib / "vacances.jpg"
+    nodate.write_bytes(b"no-date-bytes")
+
+    # Set wrong mtimes initially
+    wrong_ts = datetime(2020, 1, 1, 0, 0, 0).timestamp()
+    os.utime(pxl, (wrong_ts, wrong_ts))
+    os.utime(wa, (wrong_ts, wrong_ts))
+
+    pxl_sha1 = LocalProvider.compute_sha1_hex(pxl)
+    wa_sha1 = LocalProvider.compute_sha1_hex(wa)
+
+    # Mock Immich: pxl exists with wrong date, wa is NOT in Immich
+    immich_dates = {"asset-pxl": "2020-01-01T00:00:00Z"}
+    updated_calls: list[tuple[str, str]] = []
+
+    mock_http = MagicMock()
+
+    def fake_post(url, headers=None, json=None):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        results = []
+        for entry in json["assets"]:
+            if entry["checksum"] == pxl_sha1:
+                results.append({"id": entry["id"], "action": "reject", "assetId": "asset-pxl"})
+            else:
+                results.append({"id": entry["id"], "action": "accept"})
+        resp.json.return_value = {"results": results}
+        return resp
+
+    def fake_get(url, headers=None):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        aid = url.rsplit("/assets/", 1)[1]
+        resp.json.return_value = {
+            "id": aid,
+            "fileCreatedAt": immich_dates[aid],
+            "exifInfo": {"dateTimeOriginal": immich_dates[aid]},
+        }
+        return resp
+
+    def fake_put(url, headers=None, json=None):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        aid = url.rsplit("/assets/", 1)[1]
+        immich_dates[aid] = json["dateTimeOriginal"]
+        updated_calls.append((aid, json["dateTimeOriginal"]))
+        resp.json.return_value = {"id": aid}
+        return resp
+
+    mock_http.post.side_effect = fake_post
+    mock_http.get.side_effect = fake_get
+    mock_http.put.side_effect = fake_put
+
+    immich = ImmichProvider(base_url="http://localhost:2283", api_key="k", http_client=mock_http)
+
+    # Dry-run modifies nothing
+    dry = fix_dates_from_filenames(root_dir=tmp_path / "_library", immich=immich, dry_run=True)
+    assert dry["dated_files"] == 2
+    assert dry["local_updated"] == 2
+    assert dry["immich_updated"] == 1
+    assert dry["immich_not_found"] == 1
+    assert updated_calls == []
+    assert abs(pxl.stat().st_mtime - wrong_ts) < 1.0
+
+    # Real run updates both local mtimes and Immich dateTimeOriginal
+    stats = fix_dates_from_filenames(root_dir=tmp_path / "_library", immich=immich, dry_run=False)
+    assert stats["local_updated"] == 2
+    assert stats["immich_updated"] == 1
+    assert stats["immich_not_found"] == 1
+    assert abs(pxl.stat().st_mtime - datetime(2026, 8, 21, 8, 23, 37).timestamp()) < 1.0
+    assert abs(wa.stat().st_mtime - datetime(2016, 2, 21, 12, 0, 0).timestamp()) < 1.0
+    assert len(updated_calls) == 1
+    assert updated_calls[0][0] == "asset-pxl"
+    assert updated_calls[0][1].startswith("2026-08-21T08:23:37")
+
+    # Re-running is idempotent (0 updates)
+    stats2 = fix_dates_from_filenames(root_dir=tmp_path / "_library", immich=immich, dry_run=False)
+    assert stats2["local_updated"] == 0
+    assert stats2["local_already_ok"] == 2
+    assert stats2["immich_updated"] == 0
+    assert stats2["immich_already_ok"] == 1
+
+    # CLI --tolerance only accepts non-negative integers (rejects floats like 2.0)
+    import pytest
+    from scripts.fix_dates_from_filenames import main as fix_dates_main
+
+    with pytest.raises(SystemExit) as exc_info:
+        fix_dates_main([str(tmp_path / "_library"), "--local-only", "--tolerance", "2.0"])
+    assert exc_info.value.code == 2
+    assert fix_dates_main([str(tmp_path / "_library"), "--local-only", "--tolerance", "2"]) == 0
+
+
+def test_youtube_uploads_videos_largest_first(tmp_path: Path) -> None:
+    """Verify --largest-first uploads videos in descending size order and reuses a persistent video index without rescanning."""
+    from crosspix.youtube import YouTubeProvider
+
+    root = tmp_path / "Ente"
+    alb_a = root / "albums" / "AlbumA"
+    alb_b = root / "albums" / "AlbumB"
+    alb_a.mkdir(parents=True)
+    alb_b.mkdir(parents=True)
+
+    (alb_a / "small.mp4").write_bytes(b"\x01" * 100_000)
+    (alb_b / "huge.mp4").write_bytes(b"\x02" * 500_000)
+    (alb_a / "medium.mp4").write_bytes(b"\x03" * 300_000)
+
+    yt_service, yt_videos, _, _ = _make_fake_youtube_service()
+    source = LocalProvider(root_dir=root, albums_only=True)
+    yt = YouTubeProvider(service=yt_service, on_progress=lambda _: None)
+    syncer = PhotoSynchronizer(largest_first=True, on_progress=lambda _: None)
+
+    res = syncer.sync(source, yt)
+    assert [item.filename for item in res.copied] == ["huge.mp4", "medium.mp4", "small.mp4"]
+    assert len(yt_videos) == 3
+
+    index_file = root / ".crosspix_video_index.json"
+    assert index_file.is_file()
+
+    # Second launch must load from the cached index without calling iter_streaming_folders again!
+    source_no_scan = LocalProvider(root_dir=root, albums_only=True)
+    source_no_scan.iter_streaming_folders = MagicMock(side_effect=AssertionError("should not rescan folder!"))
+    yt2 = YouTubeProvider(service=yt_service, on_progress=lambda _: None)
+    res2 = syncer.sync(source_no_scan, yt2)
+    assert len(res2.copied) == 0
+    assert len(res2.skipped) == 3
+    assert source_no_scan.iter_streaming_folders.call_count == 0
+
+
+def test_youtube_stops_immediately_on_http_429(tmp_path: Path) -> None:
+    """Verify YouTube export stops immediately on the first HttpError 429 and resumes from index without rescanning."""
+    from googleapiclient.errors import HttpError
+    from crosspix.youtube import YouTubeProvider
+
+    root = tmp_path / "Ente"
+    alb = root / "albums" / "Famille"
+    alb.mkdir(parents=True)
+    (alb / "v1_huge.mp4").write_bytes(b"\x01" * 500_000)
+    (alb / "v2_med.mp4").write_bytes(b"\x02" * 300_000)
+    (alb / "v3_small.mp4").write_bytes(b"\x03" * 100_000)
+
+    yt_service, yt_videos, _, _ = _make_fake_youtube_service()
+    orig_insert = yt_service.videos.return_value.insert.side_effect
+    attempted_titles: list[str] = []
+    fail_v2 = {"active": True}
+
+    def insert_with_429(part, body, media_body):
+        title = body["snippet"]["title"]
+        attempted_titles.append(title)
+        if fail_v2["active"] and "v2_med" in title:
+            resp = MagicMock()
+            resp.status = 429
+            resp.reason = "Too Many Requests"
+            raise HttpError(resp=resp, content=b"Too Many Requests")
+        return orig_insert(part, body, media_body)
+
+    yt_service.videos.return_value.insert.side_effect = insert_with_429
+
+    err_log = tmp_path / "error.log"
+    source = LocalProvider(root_dir=root, albums_only=True)
+    yt = YouTubeProvider(service=yt_service, on_progress=lambda _: None)
+    syncer = PhotoSynchronizer(largest_first=True, error_log_path=err_log, on_progress=lambda _: None)
+
+    res = syncer.sync(source, yt)
+    assert len(res.copied) == 1
+    assert res.copied[0].filename == "v1_huge.mp4"
+    assert len(res.errors) == 1
+    assert len(attempted_titles) == 2  # stopped right after v2_med; v3_small never attempted!
+    assert err_log.exists() and "429" in err_log.read_text(encoding="utf-8")
+
+    # Resume next day: skips v1_huge from index without rescanning and uploads v2_med then v3_small!
+    fail_v2["active"] = False
+    source_resume = LocalProvider(root_dir=root, albums_only=True)
+    source_resume.iter_streaming_folders = MagicMock(side_effect=AssertionError("should not rescan folder!"))
+    yt_resume = YouTubeProvider(service=yt_service, on_progress=lambda _: None)
+    res_resume = syncer.sync(source_resume, yt_resume)
+    assert [item.filename for item in res_resume.copied] == ["v2_med.mp4", "v3_small.mp4"]
+    assert len(res_resume.skipped) == 1
+    assert source_resume.iter_streaming_folders.call_count == 0
+
+    # Also verify HttpError 400 uploadLimitExceeded stops immediately
+    from crosspix.youtube import is_youtube_rate_limit_error
+
+    resp400 = MagicMock()
+    resp400.status = 400
+    resp400.reason = "Bad Request"
+    err_limit = HttpError(
+        resp=resp400,
+        content=(
+            b'{"error": {"code": 400, "message": "The user has exceeded the number of videos they may upload.", '
+            b'"errors": [{"message": "The user has exceeded the number of videos they may upload.", '
+            b'"domain": "youtube.video", "reason": "uploadLimitExceeded"}]}}'
+        ),
+    )
+    assert is_youtube_rate_limit_error(err_limit) is True
+
+
+
 
 
 

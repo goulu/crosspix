@@ -8,7 +8,7 @@ from crosspix.local import LocalProvider
 from crosspix.sync import PhotoSynchronizer, SyncResult
 from crosspix.youtube import YouTubeProvider
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "PhotoItem",

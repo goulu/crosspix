@@ -67,16 +67,83 @@ Photos/
 
 ## Installation
 
-Clone the repository and create the Python virtual environment (`.venv`):
+`crosspix` requires **Python 3.11 or newer** (Python 3.12 recommended). Below are complete step-by-step instructions for **Windows**, **macOS**, and **Linux** — even if Python and Git are not yet installed on your machine.
 
-```bash
-git clone https://github.com/goulu/crosspix.git
-cd crosspix
+### Windows (10 / 11)
 
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-```
+1. **Install Python and Git** (open **PowerShell** from the Start menu):
+   ```powershell
+   winget install -e --id Python.Python.3.12
+   winget install -e --id Git.Git
+   ```
+   *(Alternatively, download the official installers from [python.org/downloads](https://www.python.org/downloads/) — make sure to check **"Add python.exe to PATH"** during setup — and [git-scm.com](https://git-scm.com/downloads). Then close and reopen PowerShell.)*
+2. **Download `crosspix` and install it in a virtual environment**:
+   ```powershell
+   git clone https://github.com/goulu/crosspix.git
+   cd crosspix
+
+   py -3.12 -m venv .venv
+   .\.venv\Scripts\python.exe -m pip install --upgrade pip
+   .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+   ```
+3. **Verify the installation**:
+   ```powershell
+   .\.venv\Scripts\python.exe -m crosspix --help
+   ```
+   *(On Windows, replace `.venv/bin/python` in the examples below with `.\.venv\Scripts\python.exe`.)*
+
+### macOS
+
+1. **Install Python and Git** (open **Terminal**):
+   - **Option A — via [Homebrew](https://brew.sh/)** (recommended):
+     ```bash
+     brew install python@3.12 git
+     ```
+   - **Option B — without Homebrew**: download the macOS installer from [python.org/downloads](https://www.python.org/downloads/) and run `xcode-select --install` in Terminal to install Git.
+2. **Download `crosspix` and install it in a virtual environment**:
+   ```bash
+   git clone https://github.com/goulu/crosspix.git
+   cd crosspix
+
+   python3 -m venv .venv
+   source .venv/bin/activate
+   python -m pip install --upgrade pip
+   pip install -e ".[dev]"
+   ```
+3. **Verify the installation**:
+   ```bash
+   .venv/bin/python -m crosspix --help
+   ```
+
+### Linux (Ubuntu / Debian / Linux Mint / Fedora / Arch)
+
+1. **Install Python, `venv`, and Git**:
+   ```bash
+   # Ubuntu / Debian / Linux Mint
+   sudo apt update && sudo apt install -y python3 python3-venv python3-pip git
+
+   # Fedora
+   sudo dnf install -y python3 python3-pip git
+
+   # Arch Linux
+   sudo pacman -S python python-pip git
+   ```
+2. **Download `crosspix` and install it in a virtual environment**:
+   ```bash
+   git clone https://github.com/goulu/crosspix.git
+   cd crosspix
+
+   python3 -m venv .venv
+   source .venv/bin/activate
+   python -m pip install --upgrade pip
+   pip install -e ".[dev]"
+   ```
+3. **Verify the installation**:
+   ```bash
+   .venv/bin/python -m crosspix --help
+   ```
+
+> **Tip (no Git?)**: On any OS, you can also click **Code → Download ZIP** on [github.com/goulu/crosspix](https://github.com/goulu/crosspix), extract the archive, open a terminal inside the extracted folder, and run steps 2–3 starting from the `venv` creation command.
 
 ---
 
@@ -184,6 +251,9 @@ By default, `crosspix sync` to non-YouTube targets skips video files larger than
 # Sync ONLY videos >= 100 MB from albums/ to private YouTube playlists
 .venv/bin/python -m crosspix sync local:/home/goulu/Images/Ente youtube --albums-only --min-video-size-mb 100
 
+# Upload largest videos first (creates & reuses <source>/.crosspix_video_index.json to avoid rescanning; stops immediately on HttpError 429 or uploadLimitExceeded)
+.venv/bin/python -m crosspix sync local:/home/goulu/Images/Ente youtube --min-video-size-mb 100 --largest-first
+
 # Preview which large videos would be uploaded to YouTube
 .venv/bin/python -m crosspix sync local:/home/goulu/Images/Ente youtube --albums-only --min-video-size-mb 100 --dry-run
 
@@ -225,6 +295,32 @@ Cleans up redundant variant copies within each `_library/YYYY/MM/` folder and re
 .venv/bin/python scripts/deduplicate_library_variants.py /home/goulu/Images/Ente
 
 # Optional flags: --rename-standalone, --skip-albums, --albums-only, --verbose
+```
+
+### 3. Fix Local & Immich Dates from Filenames (`scripts/fix_dates_from_filenames.py`)
+Walks a directory sequentially (e.g. `/home/goulu/Images/Ente/_library`, ignoring hidden directories such as `.meta/` and `metadata/`), extracts a capture date/time from each media filename, adjusts the local file's modification time (`mtime`), and updates the matching asset's `dateTimeOriginal` in Immich if present:
+
+- **Supported filename patterns**:
+  - Date + time (with optional 3 millisecond digits): `PXL_20260821_082337164.mp4` → `2026-08-21 08:23:37`, `20150702_201509_18738559163_o.jpg` → `2015-07-02 20:15:09`, `IMG_20240520_114346.jpg`, `Screenshot_2014-12-18-21-19-21.png`.
+  - Date only (no time present): `IMG-20160221-WA0012.jpeg` or `20160221_14735170026_o.jpg` → defaults time to **`12:00:00`** (`2016-02-21 12:00:00`).
+  - Long numeric identifiers (such as Flickr IDs) are safely ignored.
+- **Local update**: updates `mtime` via `os.utime` (which automatically updates hardlinked copies under `albums/`) only when it differs by more than `--tolerance` seconds.
+- **Immich update**: looks up files in Immich in batches (`POST /api/assets/bulk-upload-check` using SHA-1, reading the API key from `immich.token` by default), compares the asset's current `dateTimeOriginal` (`GET /api/assets/{id}`), and calls `PUT /api/assets/{id}` only when the timestamp differs by more than `--tolerance` seconds.
+- **Options**:
+  - `--local-only` / `--immich-only`: restrict updates to local files or to Immich only.
+  - `--tolerance N`: whole number of seconds (`>= 0`, default: `2`) within which existing dates are considered already accurate (re-running is idempotent).
+  - `--immich-url URL`, `--immich-key KEY`, `--immich-key-file PATH` (default: `immich.token`).
+  - `--batch-size N` (default: `50`), `--error-log PATH` (default: `error.log`), `--dry-run` / `-n`, `--verbose` / `-v`.
+
+```bash
+# Preview changes without modifying disk or Immich
+.venv/bin/python scripts/fix_dates_from_filenames.py /home/goulu/Images/Ente/_library --dry-run
+
+# Adjust local mtimes and Immich dates (reads API key from immich.token)
+.venv/bin/python scripts/fix_dates_from_filenames.py /home/goulu/Images/Ente/_library
+
+# Adjust local mtimes only, with a 5-second integer tolerance
+.venv/bin/python scripts/fix_dates_from_filenames.py /home/goulu/Images/Ente/_library --local-only --tolerance 5 --verbose
 ```
 
 ---
